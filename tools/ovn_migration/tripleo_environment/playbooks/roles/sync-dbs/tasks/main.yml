@@ -38,7 +38,7 @@
     neutron-ovn-db-sync-util --config-file /etc/neutron/neutron.conf
     --config-file /etc/neutron/plugins/ml2/ml2_conf.ini
     --log-file /var/log/neutron/neutron-db-sync.log
-    --ovn-neutron_sync_mode {{ db_sync_mode }}
+    --ovn-neutron_sync_mode migrate
     --debug
   when: ovn_central is defined
 

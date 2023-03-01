@@ -173,11 +173,11 @@ def main():
     logging.setup(conf, 'neutron_ovn_db_sync_util')
     LOG.info('Started Neutron OVN db sync')
     mode = ovn_conf.get_ovn_neutron_sync_mode()
+    # Migrate mode will run as repair mode in the synchronizer
+    migrate = False
     if mode == ovn_conf.MIGRATE_MODE:
-        LOG.info("Migrating Neutron database from OVS to OVN")
-        db_migration.migrate_neutron_database_to_ovn()
-        LOG.info("Neutron database migration from OVS to OVN completed")
-        return
+        mode = ovn_db_sync.SYNC_MODE_REPAIR
+        migrate = True
     if mode not in [ovn_db_sync.SYNC_MODE_LOG, ovn_db_sync.SYNC_MODE_REPAIR]:
         LOG.error(
             'Invalid sync mode : ["%s"]. Should be "log" or "repair"', mode)
@@ -244,3 +244,8 @@ def main():
     LOG.info('Sync for Southbound db started with mode : %s', mode)
     sb_synchronizer.do_sync()
     LOG.info('Sync completed for Southbound db')
+
+    if migrate:
+        LOG.info("Migrating Neutron database from OVS to OVN")
+        db_migration.migrate_neutron_database_to_ovn()
+        LOG.info("Neutron database migration from OVS to OVN completed")
