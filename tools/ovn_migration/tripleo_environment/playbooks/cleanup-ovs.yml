@@ -4,6 +4,16 @@
   roles:
     - cleanup
 
+- name: Set Neutron config back to non-migration mode
+  hosts: neutron-api
+  tasks:
+    - name: set migration mode to False
+      ini_file:
+        path: /var/lib/config-data/puppet-generated/neutron/etc/neutron/plugins/ml2/ml2_conf.ini
+        section: DEFAULT
+        option: migration_mode
+        value: False
+
 - name: cleanup Neutron ml2/OVS resources
   hosts: localhost
   roles:
