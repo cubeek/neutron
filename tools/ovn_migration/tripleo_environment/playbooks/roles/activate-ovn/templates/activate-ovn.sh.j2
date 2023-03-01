@@ -17,21 +17,13 @@ if [ "x$ovn_bms" != "x" ]; then
     ovs-vsctl set open . external_ids:ovn-bridge-mappings="$ovn_bms" -- remove open . external_ids ovn-bridge-mappings-back
 fi
 
-# Activate ovn-controller by configuring integration bridge, configure bridge mappings and remove br-migration
-ovs-vsctl set open . external_ids:ovn-bridge={{ ovn_bridge }} -- --if-exists del-br br-migration
+# Don't wait with openflow installation
+ovs-vsctl remove open . external_ids ovn-ofctrl-wait-before-clear
 
-# Wait for ovn-controller to catch up
-sleep 5
-
-# Reset OpenFlow protocol version before ovn-controller takes over, it will cause flow installation
+# Reset OpenFlow protocol version
 ovs-vsctl set Bridge {{ ovn_bridge }} protocols=[]
 
-# Wait for flows to be installed
-while [ $(ovs-ofctl dump-flows {{ ovn_bridge }} table=23 | grep resubmit -c) -eq 0 ]; do
-   :
-done
-
-# Flush datapath flows
-ovs-dpctl del-flows
+# Activate ovn-controller by configuring integration bridge, configure bridge mappings and remove br-migration
+ovs-vsctl set open . external_ids:ovn-bridge={{ ovn_bridge }} -- --if-exists del-br br-migration
 
 exit 0
