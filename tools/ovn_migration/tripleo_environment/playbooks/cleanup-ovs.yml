@@ -4,8 +4,9 @@
   roles:
     - cleanup
 
-- name: Set Neutron config back to non-migration mode
+- name: Cleanup neutron servers
   hosts: neutron-api
+  become: yes
   tasks:
     - name: set migration mode to False
       ini_file:
@@ -13,6 +14,12 @@
         section: DEFAULT
         option: migration_mode
         value: False
+
+    - name: Remove trunk bridge configuration from vif details
+      shell: |
+        galera_container=$(podman ps -a --format {% raw %}"{{.ID}}"{% endraw %} --filter "name=galera-bundle-podman")
+        podman exec $galera_container mysql ovs_neutron -e "update ml2_port_bindings set vif_details='{\"connectivity\": \"l2\", \"port_filter\": true, \"ovs_hybrid_plug\": true, \"datapath_type\": \"system\", \"bridge_name\": \"br-int\"}' where vif_details like '%\"bridge_name\": \"tbr%';"
+      when: ovn_central is defined
 
 - name: cleanup Neutron ml2/OVS resources
   hosts: localhost

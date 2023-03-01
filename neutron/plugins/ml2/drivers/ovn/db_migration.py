@@ -12,13 +12,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron_lib.api.definitions import portbindings as pb_api
 from neutron_lib import context as n_context
 from neutron_lib.db import api as db_api
-from neutron_lib import exceptions
-from oslo_db import exception as db_exc
 from oslo_log import log as logging
-from sqlalchemy.orm import exc as sqla_exc
 
 from neutron.db.models.plugins.ml2 import geneveallocation
 from neutron.db.models.plugins.ml2 import vxlanallocation
@@ -28,10 +24,6 @@ from neutron.objects import trunk as trunk_obj
 
 
 LOG = logging.getLogger(__name__)
-
-VIF_DETAILS_TO_REMOVE = (
-    pb_api.VIF_DETAILS_BRIDGE_NAME,
-)
 
 
 def migrate_neutron_database_to_ovn():
@@ -58,47 +50,6 @@ def migrate_neutron_database_to_ovn():
             session.query(vxlanallocation.VxlanAllocation).filter(
                 vxlanallocation.VxlanAllocation.vxlan_vni ==
                 segment.segmentation_id).update({"allocated": False})
-
-    # Update ``PortBinding`` objects.
-    pb_updated = set([])
-    pb_missed = set([])
-    while True:
-        pb_current = port_obj.PortBinding.get_port_id_and_host(
-            ctx, vif_type='ovs', vnic_type='normal', status='ACTIVE')
-        diff = set(pb_current).difference(pb_updated)
-        if not diff:
-            break
-
-        for port_id, host in diff:
-            try:
-                with db_api.CONTEXT_WRITER.using(ctx):
-                    pb = port_obj.PortBinding.get_object(ctx, port_id=port_id,
-                                                         host=host)
-                    if not pb or not pb.vif_details:
-                        continue
-
-                    vif_details = pb.vif_details.copy()
-                    for detail in VIF_DETAILS_TO_REMOVE:
-                        try:
-                            del vif_details[detail]
-                        except KeyError:
-                            pass
-                    if vif_details == pb.vif_details:
-                        continue
-
-                    pb.vif_details = vif_details
-                    pb.update()
-            except (exceptions.ObjectNotFound,
-                    sqla_exc.StaleDataError,
-                    db_exc.DBDeadlock):
-                # The PortBinding register has been already modified.
-                pb_missed.add(port_id)
-
-        pb_updated.update(diff)
-
-    if pb_missed:
-        LOG.warning('The following ports did not update their port binding '
-                    'records: %s', ', '.join(pb_missed))
 
     # Update ``Trunk`` objects.
     trunk_updated = set([])
