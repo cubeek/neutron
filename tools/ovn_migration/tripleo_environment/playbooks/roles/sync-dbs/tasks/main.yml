@@ -49,7 +49,7 @@
 - name: set migration mode to True
   ini_file:
     path: /var/lib/config-data/puppet-generated/neutron/etc/neutron/plugins/ml2/ml2_conf.ini
-    section: ml2
+    section: DEFAULT
     option: migration_mode
     value: True
   when: db_sync_mode == "repair"
@@ -57,7 +57,7 @@
 - name: set migration mode to False
   ini_file:
     path: /var/lib/config-data/puppet-generated/neutron/etc/neutron/plugins/ml2/ml2_conf.ini
-    section: ml2
+    section: DEFAULT
     option: migration_mode
     value: False
   when: db_sync_mode == "migrate"

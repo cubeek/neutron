@@ -77,10 +77,6 @@ ml2_opts = [
                       "Neutron server and the mechanism driver agents; it is "
                       "recommended not to change it once any resource "
                       "provider register has been created.")),
-    cfg.BoolOpt('migration_mode', default=False,
-                help=_("The option tells to that the environment is in "
-                       "the process of mechanism driver migration from OVS to "
-                       "OVN.")),
 ]
 
 

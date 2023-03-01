@@ -1029,7 +1029,7 @@ class OVSNeutronAgent(l2population_rpc.L2populationRpcCallBackTunnelMixin,
         :param segmentation_id: the VID for 'vlan' or tunnel ID for 'tunnel'
         '''
 
-        if network_type == n_const.TYPE_GENEVE and cfg.CONF.ml2.migration_mode:
+        if network_type == n_const.TYPE_GENEVE and cfg.CONF.migration_mode:
            network_type = n_const.TYPE_VXLAN 
         lvm = self._add_local_vlan(net_uuid, network_type, physical_network,
                                    segmentation_id)

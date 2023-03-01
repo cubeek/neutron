@@ -376,8 +376,7 @@ class OVNMechanismDriver(api.MechanismDriver):
                 maintenance.DBInconsistenciesPeriodics(self._ovn_client))
             self._maintenance_thread.start()
             LOG.info("Maintenance task thread has started")
-        elif (worker_class == service.RpcWorker and
-                cfg.CONF.ml2.migration_mode):
+        elif worker_class == service.RpcWorker and cfg.CONF.migration_mode:
             LOG.debug("Registering RCP trunk")
             self.trunk_driver.register_rpc_backend()
 

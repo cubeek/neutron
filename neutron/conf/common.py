@@ -151,6 +151,10 @@ core_opts = [
                        '2. DHCP scheduler API extension '
                        '3. Network scheduling mechanism '
                        '4. DHCP RPC/notification')),
+    cfg.BoolOpt('migration_mode', default=False,
+                help=_("The option tells to that the environment is in "
+                       "the process of mechanism driver migration from OVS to "
+                       "OVN.")),
 ]
 
 core_cli_opts = [
