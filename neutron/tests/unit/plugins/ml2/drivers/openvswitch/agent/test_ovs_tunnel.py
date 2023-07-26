@@ -188,7 +188,8 @@ class TunnelTest(object):
             '_check_bridge_datapath_id').start()
         self._define_expected_calls()
 
-    def _define_expected_calls(self, arp_responder=False, igmp_snooping=False):
+    def _define_expected_calls(
+            self, arp_responder=False, igmp_snooping=False, dvr_enabled=False):
         self.mock_int_bridge_cls_expected = [
             mock.call(self.INT_BRIDGE,
                       datapath_type=mock.ANY),
@@ -268,7 +269,8 @@ class TunnelTest(object):
         ]
 
         self.mock_tun_bridge_expected += [
-            mock.call.setup_default_table(self.INT_OFPORT, arp_responder),
+            mock.call.setup_default_table(
+                self.INT_OFPORT, arp_responder, dvr_enabled),
         ]
 
         self.ipdevice_expected = []

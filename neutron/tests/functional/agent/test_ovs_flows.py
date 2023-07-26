@@ -311,8 +311,9 @@ class OVSFlowTestCase(OVSAgentTestBase):
     """
 
     def setUp(self):
+        dvr_enabled = True
         cfg.CONF.set_override('enable_distributed_routing',
-                              True,
+                              dvr_enabled,
                               group='AGENT')
         super(OVSFlowTestCase, self).setUp()
         self.phys_br = self.useFixture(net_helpers.OVSBridgeFixture()).bridge
@@ -334,7 +335,7 @@ class OVSFlowTestCase(OVSAgentTestBase):
                 prefix=cfg.CONF.OVS.tun_peer_patch_port),
             common_utils.get_rand_device_name(
                 prefix=cfg.CONF.OVS.int_peer_patch_port))
-        self.br_tun.setup_default_table(self.tun_p, True)
+        self.br_tun.setup_default_table(self.tun_p, True, dvr_enabled)
 
     def test_provision_local_vlan(self):
         kwargs = {'port': 123, 'lvid': 888, 'segmentation_id': 777}
