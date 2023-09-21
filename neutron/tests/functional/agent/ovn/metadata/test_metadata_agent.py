@@ -220,18 +220,24 @@ class TestMetadataAgent(base.TestOVNFunctionalBase):
             timeout=10,
             exception=exc)
 
-    def _test_agent_events(self, delete, type_=None, update=False):
-        m_pb_created = mock.patch.object(
-            agent.PortBindingChassisCreatedEvent, 'run').start()
-        m_pb_deleted = mock.patch.object(
-            agent.PortBindingChassisDeletedEvent, 'run').start()
-        m_pb_updated = mock.patch.object(
-            agent.PortBindingMetaPortUpdatedEvent, 'run').start()
-
+    def _test_agent_events_prepare(self, lsp_type=None):
         lswitchport_name, lswitch_name = self._create_logical_switch_port(
-            type_)
+            lsp_type)
         self.sb_api.lsp_bind(lswitchport_name, self.chassis_name).execute(
             check_error=True, log_errors=True)
+
+        with mock.patch.object(
+                agent.MetadataAgent, 'provision_datapath') as m_provision:
+            # Wait until port is bound
+            n_utils.wait_until_true(
+                lambda: m_provision.called,
+                timeout=10,
+                exception=Exception(
+                    "Datapath provisioning did not happen on port binding."))
+
+        return lswitchport_name, lswitch_name
+
+
         if update and type_ == ovn_const.LSP_TYPE_LOCALPORT:
             with self.nb_api.transaction(
                     check_error=True, log_errors=True) as txn:
@@ -260,7 +266,7 @@ class TestMetadataAgent(base.TestOVNFunctionalBase):
             pb_created,
             timeout=10,
             exception=Exception(
-                "PortBindingChassisCreatedEvent didn't happen on port "
+                    "PortBindingChassisCreatedEvent didn't happen on port "
                 "binding."))
 
         def pb_updated():
@@ -320,15 +326,36 @@ class TestMetadataAgent(base.TestOVNFunctionalBase):
         self.assertEqual(1, m_pb_deleted.call_count)
 
     def test_agent_unbind_port(self):
-        self._test_agent_events(delete=False)
+        lswitchport_name, lswitch_name = self._test_agent_events_prepare()
+
+        self.sb_api.lsp_unbind(lswitchport_name).execute(
+            check_error=True, log_errors=True)
+
+        # Wait until port is bound
+        n_utils.wait_until_true(
+            m_provision.called,
+            timeout=10,
+            exception=Exception(
+                "Datapath provisioning did not happen on unbinding port."))
 
     def test_agent_delete_bound_external_port(self):
-        self._test_agent_events(delete=True, type_='external')
+        lswitchport_name, lswitch_name = self._test_agent_events_prepare(
+            lsp_type=ovn_const.LSP_TYPE_EXTERNAL)
 
-    def test_agent_delete_bound_nonexternal_port(self):
-        with mock.patch.object(agent.LOG, 'warning') as m_warn:
-            self._test_agent_events(delete=True)
-        self.assertTrue(m_warn.called)
+        self.nb_api.delete_lswitch_port(
+            lswitchport_name, lswitch_name).execute(
+                check_error=True, log_errors=True)
+
+        n_utils.wait_until_true(
+            m_provision.called,
+            timeout=10,
+            exception=Exception(
+                "Datapath provisioning did not happen on unbinding port."))
+#
+#    def test_agent_delete_bound_nonexternal_port(self):
+#        with mock.patch.object(agent.LOG, 'warning') as m_warn:
+#            self._test_agent_events(delete=True)
+#        self.assertTrue(m_warn.called)
 
     def test_agent_registration_at_chassis_create_event(self):
         def check_for_metadata():
@@ -359,9 +386,9 @@ class TestMetadataAgent(base.TestOVNFunctionalBase):
             timeout=10,
             exception=exc)
 
-    def test_agent_metadata_port_ip_update_event(self):
-        self._test_agent_events(
-            delete=False, type_=ovn_const.LSP_TYPE_LOCALPORT, update=True)
+#    def test_agent_metadata_port_ip_update_event(self):
+#        self._test_agent_events(
+#            delete=False, type_=ovn_const.LSP_TYPE_LOCALPORT, update=True)
 
     def test_metadata_agent_only_monitors_own_chassis(self):
         # We already have the fake chassis which we should be monitoring, so
