@@ -1395,6 +1395,25 @@ class TestMaintenance(_TestMaintenanceHelper):
             if route.ip_prefix == '30.0.0.0/24':
                 self.assertEqual({}, route.external_ids)
 
+    def test_set_distributed_flag(self):
+        ovn_conf.cfg.CONF.set_override('enable_distributed_floating_ip', True)
+        nb_global_ext_id = self.nb_idl.db_get(
+            'NB_Global', '.').execute(check_error=True)
+        self.assertNotIn(ovn_const.OVN_FIP_DISTRIBUTED, nb_global_ext_id)
+
+        self.assertRaises(
+            periodics.NeverAgain, self.maint.set_distributed_flag)
+
+        nb_global_ext_id = self.nb_idl.db_get(
+            'NB_Global', '.').execute(check_error=True)
+        self.assertEqual(
+            "True", nb_global_ext_id[ovn_const.OVN_FIP_DISTRIBUTED)
+
+    def test_set_distributed_flag_changed(self):
+        pass
+
+    def test_set_distributed_flag_unchanged(self):
+        pass
 
 class TestLogMaintenance(_TestMaintenanceHelper,
                          test_log_driver.LogApiTestCaseBase):
