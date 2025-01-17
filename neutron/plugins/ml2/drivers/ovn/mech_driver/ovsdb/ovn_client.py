@@ -977,6 +977,23 @@ class OVNClient:
                         floatingip['id'])
         self._transaction(commands, txn=txn)
 
+    def _just_update_floatingip(self, ovn_fip, floatingip, fip_request, txn):
+        external_ids = {
+            ovn_const.OVN_FIP_PORT_EXT_ID_KEY: floatingip['port_id'],
+            ovn_const.OVN_REV_NUM_EXT_ID_KEY: str(utils.get_revision_number(
+                floatingip, ovn_const.TYPE_FLOATINGIPS)),
+        }
+        LOG.debug("XXX ovn_fip: %s", ovn_fip)
+        fixed_ip = fip_request.get(
+            'fixed_ip_address', floatingip['fixed_ip_address'])
+        txn.add(self._nb_idl.db_set(
+            'NAT',
+            str(ovn_fip['_uuid']),
+            external_ids=external_ids,
+            logical_ip=fixed_ip,
+            logical_port=floatingip['port_id'],
+        ))
+
     def _is_lb_member_fip(self, context, fip):
         port = self._plugin.get_port(
             context, fip['port_id'])
@@ -1166,27 +1183,28 @@ class OVNClient:
     def update_floatingip(self, context, floatingip, fip_request=None):
         fip_status = None
         router_id = None
+        LOG.debug("XXX floatingip: %s", floatingip)
         ovn_fip = self._nb_idl.get_floatingip(floatingip['id'])
         fip_request = fip_request[l3.FLOATINGIP] if fip_request else {}
         qos_update_only = (len(fip_request.keys()) == 1 and
                            qos_consts.QOS_POLICY_ID in fip_request)
 
+        LOG.debug("XXX fip_request: %s", fip_request)
         check_rev_cmd = self._nb_idl.check_revision_number(
             floatingip['id'], floatingip, ovn_const.TYPE_FLOATINGIPS)
         with self._nb_idl.transaction(check_error=True) as txn:
             txn.add(check_rev_cmd)
             # If FIP updates the QoS policy only, skip the OVN NAT rules update
             if not qos_update_only:
-                if ovn_fip:
+                if ovn_fip and fip_request.get('port_id'):
+                    self._just_update_floatingip(
+                        ovn_fip, floatingip, fip_request, txn)
+                elif ovn_fip:
                     lrouter = ovn_fip['external_ids'].get(
                         ovn_const.OVN_ROUTER_NAME_EXT_ID_KEY,
                         utils.ovn_name(router_id))
                     self._delete_floatingip(ovn_fip, lrouter, txn=txn)
                     fip_status = const.FLOATINGIP_STATUS_DOWN
-
-                if floatingip.get('port_id'):
-                    self._create_or_update_floatingip(floatingip, txn=txn)
-                    fip_status = const.FLOATINGIP_STATUS_ACTIVE
 
             self._qos_driver.update_floatingip(txn, floatingip)
 
