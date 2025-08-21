@@ -12,22 +12,3 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
-BGP_OWNER_TAG = "bgp"
-OWNER_KEY = "owner-service"
-
-OVN_BGP_PEERS_KEY = 'bgp-peers'
-OVN_BGP_CHASSIS_INDEX_KEY = 'bgp-chassis-index'
-
-BGP_TAG = 'bgp-tag'
-BGP_LOCALNET = "bgp-localnet"
-
-LRP_MAIN_ROUTER_TO_INTERCONNECT_SWITCH = 1
-LRP_MAIN_ROUTER_TO_NEUTRON_SWITCH = 2
-
-LRP_CHASSIS_TO_MAIN_ROUTER = 1
-LRP_MAIN_ROUTER_TO_CHASSIS = 2
-
-AGENT_BGP_PEER_BRIDGES = 'bgp-peer-bridges'
-CHASSIS_PEER_CONNECTIONS = 'bgp-peer-connections'
-CHASSIS_BGP_LRP_MAC_MAP = 'bgp-lrp-mac-map'

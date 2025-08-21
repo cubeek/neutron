@@ -84,3 +84,15 @@ class BGPHAChassisGroupEvent(BGPEntityEvent):
     def __init__(self, reconciler):
         super().__init__(reconciler, 'HA_Chassis_Group',
                          (self.ROW_CREATE, self.ROW_UPDATE, self.ROW_DELETE))
+
+
+class BGPChassisEvent(row_event.RowEvent):
+    """Event for BGP chassis changes."""
+
+    def __init__(self, events):
+        super().__init__(events, 'Chassis', None)
+        self.event_name = self.__class__.__name__
+
+    def match_fn(self, event, row, old=None):
+        """Match BGP chassis by checking external_ids."""
+        return row.external_ids.get(constants.OWNER_KEY) == constants.BGP_OWNER_TAG
