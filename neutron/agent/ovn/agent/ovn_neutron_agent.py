@@ -239,9 +239,7 @@ class OVNNeutronAgent(service.Service):
         self.load_config()
         # Before executing "_load_sb_idl", is is needed to execute
         # "load_config" to populate self.chassis.
-        LOG.debug("XXX loading sb_idl")
         self.ext_manager_api.sb_idl = self._load_sb_idl()
-        LOG.debug("XXX loaded sb_idl")
         self.ext_manager_api.nb_idl = self._load_nb_idl()
         self.ext_manager.start()
 

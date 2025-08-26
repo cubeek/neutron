@@ -186,12 +186,10 @@ class OVNAgentExtensionAPI:
     @property
     def sb_idl(self):
         if not self._sb_idl:
-            LOG.debug("XXX waiting for sb_post_fork_event")
             self.sb_post_fork_event.wait()
         return self._sb_idl
 
     @sb_idl.setter
     def sb_idl(self, val):
-        LOG.debug("XXX setting sb_idl")
         self.sb_post_fork_event.set()
         self._sb_idl = val

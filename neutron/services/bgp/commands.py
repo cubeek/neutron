@@ -17,14 +17,14 @@ import uuid
 
 from oslo_log import log
 from ovsdbapp.backend.ovs_idl import command as cmd
+from ovsdbapp.backend.ovs_idl import idlutils
 from ovsdbapp.backend.ovs_idl import rowview
 from ovsdbapp.schema.ovn_northbound import commands as nb_cmd
 
+from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import commands as n_nb_cmd
 from neutron.services.bgp import constants
 from neutron.services.bgp import config
 from neutron.services.bgp import helpers
-from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import (
-    commands as n_nb_commands)
 
 LOG = log.getLogger(__name__)
 
@@ -87,16 +87,23 @@ class LspAddCommand(nb_cmd.LspAddCommand):
 
 
 class LrpAddCommand(nb_cmd.LrpAddCommand):
-    def __init__(self, api, router_name, lrp_name, mac, networks=None):
+    def __init__(self, api, router_name, lrp_name, mac, networks=None, **kwargs):
         networks = networks or []
-        super().__init__(
-            api, router_name, lrp_name, mac, networks, may_exist=True)
+        super().__init__(api, router_name, lrp_name, mac, networks, **kwargs)
 
     def run_idl(self, txn):
-        super().run_idl(txn)
+        try:
+            self.result = self.api.lookup('Logical_Router_Port', self.port).uuid
+        except idlutils.RowNotFound:
+            super().run_idl(txn)
 
-        if isinstance(self.result, uuid.UUID):
-            self.result = self.api.lookup('Logical_Router_Port', self.result)
+
+class HAChassisGroupAddCommand(nb_cmd.HAChassisGroupAddCommand):
+    def run_idl(self, txn):
+        try:
+            self.result = self.api.lookup('HA_Chassis_Group', self.name).uuid
+        except idlutils.RowNotFound:
+            super().run_idl(txn)
 
 
 class CreateSwitchWithLocalnetCommand(LsAddCommand):
@@ -132,11 +139,21 @@ class CreateLspLocalnetCommand(LspAddCommand):
         ).run_idl(txn)
 
 
-class CreateRouterCommand(LrAddCommand):
+class LrRouteAddCommand(nb_cmd.LrRouteAddCommand):
+    def run_idl(self, txn):
+        super().run_idl(txn)
+        if isinstance(self.result, uuid.UUID):
+            self.result = self.api.lookup('Logical_Router_Static_Route', self.result)
+
+
+class ReconcileRouterCommand(LrAddCommand):
     ROUTER_MAC_PREFIX = '00:00'
 
     def __init__(self, api, name):
-        super().__init__(api, name, may_exist=True, policies=[])
+        # We need to set policies and static_routes to empty list because IDL
+        # won't have that set until the transaction is committed
+        super().__init__(
+            api, name, may_exist=True, policies=[], static_routes=[])
         mm = helpers.LrpMacManager.get_instance()
         mm.register_router(name, self.router_mac_prefix)
 
@@ -156,7 +173,7 @@ class CreateRouterCommand(LrAddCommand):
         return f'{base_mac}:{self.ROUTER_MAC_PREFIX}'
 
 
-class CreateMainRouterCommand(CreateRouterCommand):
+class ReconcileMainRouterCommand(ReconcileRouterCommand):
     ROUTER_MAC_PREFIX = '0b:96'
 
     @property
@@ -168,10 +185,16 @@ class CreateMainRouterCommand(CreateRouterCommand):
         }
 
 
-class CreateChassisRouterCommand(CreateRouterCommand):
+class ReconcileChassisRouterCommand(ReconcileRouterCommand):
     def __init__(self, api, name, chassis):
         self.chassis = chassis
         super().__init__(api, name)
+
+    @property
+    def options(self):
+        return {
+            'chassis': self.chassis.name,
+        }
 
     @property
     def router_mac_prefix(self):
@@ -260,23 +283,24 @@ class IndexAllChassis(cmd.BaseCommand):
 
 
 class FullSyncBGPTopologyCommand(cmd.BaseCommand):
-    def __init__(self, nb_api, chassis):
+    def __init__(self, nb_api, sb_api, chassis):
         super().__init__(nb_api)
         self.chassis = chassis
+        self.sb_api = sb_api
 
     def run_idl(self, txn):
         LOG.debug("BGP full sync topology started")
-        self.create_central(txn)
-        self.create_all_chassis(txn)
+        self.reconcile_central(txn)
+        self.reconcile_all_chassis(txn)
         LOG.debug("BGP full sync topology completed")
 
-    def create_all_chassis(self, txn):
+    def reconcile_all_chassis(self, txn):
         for chassis in self.chassis:
-            CreateChassisCommand(self.api, chassis).run_idl(txn)
+            ReconcileChassisCommand(self.api, self.sb_api, chassis).run_idl(txn)
 
-    def create_central(self, txn):
+    def reconcile_central(self, txn):
         router_name = config.get_main_router_name()
-        CreateMainRouterCommand(
+        ReconcileMainRouterCommand(
             self.api,
             router_name,
         ).run_idl(txn)
@@ -338,6 +362,7 @@ class ProvisionProviderNetworkCommand(cmd.BaseCommand):
             self.gateway_ip,
             self.gateway_ip.split('/')[0],
             port=get_lrp_name(router_name, interconnect_switch_name),
+            may_exist=True,
         ).run_idl(txn)
 
         nb_cmd.LrRouteAddCommand(
@@ -345,22 +370,30 @@ class ProvisionProviderNetworkCommand(cmd.BaseCommand):
             router_name,
             '0.0.0.0/0',
             self.gateway_ip.split('/')[0],
+            may_exist=True,
         ).run_idl(txn)
 
+
 class ConnectRouterToSwitchCommand(cmd.BaseCommand):
-    def __init__(self, api, router_name, switch_name, lrp_mac):
+    def __init__(self, api, router_name, switch_name, lrp_mac, lrp_ip=None):
         super().__init__(api)
         self.router_name = router_name
         self.switch_name = switch_name
         self.lrp_mac = lrp_mac
+        self.lrp_ip = lrp_ip
 
     def run_idl(self, txn):
         lrp_name = get_lrp_name(self.router_name, self.switch_name)
+        if self.lrp_ip:
+            networks = [self.lrp_ip]
+        else:
+            networks = []
         LrpAddCommand(
             self.api,
             self.router_name,
             lrp_name,
             mac=self.lrp_mac,
+            networks=networks,
         ).run_idl(txn)
 
         lsp_name = get_lsp_name(self.switch_name, self.router_name)
@@ -386,46 +419,37 @@ class ConnectRouterToMainRouterCommand(cmd.BaseCommand):
     def run_idl(self, txn):
         mm = helpers.LrpMacManager.get_instance()
 
-        lrp_mac = mm.get_mac_address(
-            self.router_name, constants.LRP_CHASSIS_TO_MAIN_ROUTER)
         main_router_name = config.get_main_router_name()
 
-        lrp_chassis = get_lrp_name(self.router_name, main_router_name)
+        lrp_main = get_lrp_name(main_router_name, self.router_name)
+        lrp_ch = get_lrp_name(self.router_name, main_router_name)
+
+        lrp_main_mac = mm.get_mac_address(main_router_name, self.chassis_index)
+        lrp_ch_mac = mm.get_mac_address(
+            self.router_name, constants.LRP_CHASSIS_TO_MAIN_ROUTER)
+
         # TODO(jlibosva): Remove once we have IPv6 LLAs
-        lrp_ip = helpers.InternalIpManager.get_ip_cidr(
+        lrp_ch_ip = helpers.InternalIpManager.get_ip_cidr(
             self.chassis_index, constants.LRP_CHASSIS_TO_MAIN_ROUTER)
+        lrp_main_ip = helpers.InternalIpManager.get_ip_cidr(
+            self.chassis_index, constants.LRP_MAIN_ROUTER_TO_CHASSIS)
+
         LrpAddCommand(
             self.api,
             self.router_name,
-            lrp_chassis,
-            mac=lrp_mac,
-            networks=[lrp_ip],
+            lrp_ch,
+            mac=lrp_ch_mac,
+            networks=[lrp_ch_ip],
+            peer=lrp_main
         ).run_idl(txn)
 
-        lrp_mac = mm.get_mac_address(main_router_name, self.chassis_index)
-        lrp_main = get_lrp_name(main_router_name, self.router_name)
-        lrp_ip = helpers.InternalIpManager.get_ip_cidr(
-            self.chassis_index, constants.LRP_MAIN_ROUTER_TO_CHASSIS)
         LrpAddCommand(
             self.api,
             main_router_name,
             lrp_main,
-            mac=lrp_mac,
-            networks=[lrp_ip],
-        ).run_idl(txn)
-
-        cmd.DbSetCommand(
-            self.api,
-            'Logical_Router_Port',
-            lrp_chassis,
-            peer=lrp_main,
-        ).run_idl(txn)
-
-        cmd.DbSetCommand(
-            self.api,
-            'Logical_Router_Port',
-            lrp_main,
-            peer=lrp_chassis,
+            mac=lrp_main_mac,
+            networks=[lrp_main_ip],
+            peer=lrp_ch,
             ha_chassis_group=self.hcg,
             options={'dynamic-routing-maintain-vrf': 'true'},
         ).run_idl(txn)
@@ -448,9 +472,10 @@ class ConnectRouterToMainRouterCommand(cmd.BaseCommand):
         ).run_idl(txn)
 
 
-class CreateChassisCommand(cmd.BaseCommand):
-    def __init__(self, api, chassis):
+class ReconcileChassisCommand(cmd.BaseCommand):
+    def __init__(self, api, sb_api, chassis):
         super().__init__(api)
+        self.sb_api = sb_api
         self.chassis = chassis
         self.hostname = self.chassis.hostname.split('.')[0]
         self.chassis_index = int(
@@ -458,10 +483,9 @@ class CreateChassisCommand(cmd.BaseCommand):
 
     def run_idl(self, txn):
         hcg_name = f'bgp-hcg-{self.hostname}'
-        hcg = _run_idl_command(nb_cmd.HAChassisGroupAddCommand(
+        hcg = _run_idl_command(HAChassisGroupAddCommand(
             self.api,
-            hcg_name,
-            may_exist=True), txn)
+            hcg_name), txn)
 
         nb_cmd.HAChassisGroupAddChassisCommand(
             self.api,
@@ -469,17 +493,10 @@ class CreateChassisCommand(cmd.BaseCommand):
             self.chassis.name, 10).run_idl(txn)
 
         router_name = f'bgp-lr-{self.hostname}'
-        CreateChassisRouterCommand(
+        ReconcileChassisRouterCommand(
             self.api,
             router_name,
             self.chassis,
-        ).run_idl(txn)
-
-        cmd.DbSetCommand(
-            self.api,
-            'Logical_Router',
-            router_name,
-            options={'chassis': self.chassis.name},
         ).run_idl(txn)
 
         # Connect chassis router to the main router
@@ -490,56 +507,197 @@ class CreateChassisCommand(cmd.BaseCommand):
             hcg,
         ).run_idl(txn)
 
-        mm = helpers.LrpMacManager.get_instance()
+        router_name = f'bgp-lr-{self.hostname}'
         bgp_peer_mapping = helpers.get_chassis_bgp_peer_mapping(self.chassis)
 
-        for i, network_name in enumerate(
-                helpers.get_chassis_provider_networks(self.chassis)):
-            switch_name = f'bgp-ls-{self.hostname}-{network_name}'
-            CreateSwitchWithLocalnetCommand(
+        for peer_index, (network_name, (lrp_ip, peer_ip)) in enumerate(
+                bgp_peer_mapping.items()):
+            ReconcileChassisPeerCommand(
                 self.api,
-                switch_name,
+                self.sb_api,
+                self.chassis,
                 network_name,
+                lrp_ip,
+                peer_ip,
+                peer_index,
             ).run_idl(txn)
 
-            lrp_mac = mm.get_mac_address(
-                router_name, constants.LRP_CHASSIS_TO_MAIN_ROUTER + 1 + i)
-            peer_ip = bgp_peer_mapping[network_name]
-            ConnectRouterToSwitchCommand(
+class ReconcileChassisPeerCommand(cmd.BaseCommand):
+    def __init__(
+            self, api, sb_api, chassis, network_name, lrp_ip, peer_ip,
+            peer_index):
+        super().__init__(api)
+        self.sb_api = sb_api
+        self.chassis = chassis
+        self.hostname = self.chassis.hostname.split('.')[0]
+        self.chassis_index = int(
+            self.chassis.external_ids[constants.OVN_BGP_CHASSIS_INDEX_KEY])
+        self.network_name = network_name
+        self.lrp_ip = lrp_ip
+        self.peer_ip = peer_ip
+        self.peer_index = peer_index
+
+    @property
+    def mac_manager(self):
+        return helpers.LrpMacManager.get_instance()
+
+    @property
+    def router_name(self):
+        return f'bgp-lr-{self.hostname}'
+
+    @property
+    def switch_name(self):
+        return f'bgp-ls-{self.hostname}-{self.network_name}'
+
+    def add_lrp_mac_to_chassis(self, lrp_mac):
+        AddChassisLrpMacCommand(
+            self.sb_api,
+            self.chassis.name,
+            self.network_name,
+            lrp_mac,
+        ).execute(check_error=True)
+
+    def run_idl(self, txn):
+        CreateSwitchWithLocalnetCommand(
+            self.api,
+            self.switch_name,
+            self.network_name,
+        ).run_idl(txn)
+
+        lrp_mac = self.mac_manager.get_mac_address(
+            self.router_name,
+            constants.LRP_CHASSIS_ROUTER_TO_CHASSIS_SWITCH + self.peer_index)
+        ConnectRouterToSwitchCommand(
+            self.api,
+            self.router_name,
+            self.switch_name,
+            lrp_mac=lrp_mac,
+            lrp_ip=self.lrp_ip
+        ).run_idl(txn)
+
+        LOG.debug("XXX Adding route %s to %s", self.peer_ip, self.router_name)
+        lr_route = _run_idl_command(LrRouteAddCommand(
+            self.api,
+            self.router_name,
+            prefix='0.0.0.0/0',
+            nexthop=self.peer_ip,
+            ecmp=True,
+            # port parameter is OVN output_port column
+            port=get_lrp_name(self.router_name, self.switch_name),
+            may_exist=True,
+        ), txn)
+
+        # TODO(jlibosva): Workaround for ovsdbapp bug, remove once fixed
+        cmd.DbSetCommand(
+            self.api,
+            'Logical_Router_Static_Route',
+            lr_route.uuid,
+            external_ids={'foo': 'bar'},
+        ).run_idl(txn)
+        LOG.debug("XXX Added route to %s", self.router_name)
+
+        main_router_lrp_ip = helpers.InternalIpManager.get_ip(
+            self.chassis_index, constants.LRP_MAIN_ROUTER_TO_CHASSIS)
+
+        nb_cmd.LrPolicyAddCommand(
+            self.api,
+            self.router_name,
+            priority=10,
+            match=f'inport==\"{get_lrp_name(self.router_name, self.switch_name)}\"',
+            action='reroute',
+            nexthops=[main_router_lrp_ip],
+            may_exist=True,
+        ).run_idl(txn)
+
+        self.add_lrp_mac_to_chassis(lrp_mac)
+
+
+class GetChassisCommand(cmd.BaseCommand):
+    def __init__(self, api, chassis):
+        super().__init__(api)
+        self.chassis = chassis
+
+    def run_idl(self, txn):
+        try:
+            self.result = self.api.lookup('Chassis', self.chassis)
+        except idlutils.RowNotFound:
+            raise RuntimeError(f"Chassis {self.chassis} not found")
+
+
+class DeleteChassisCommand(cmd.BaseCommand):
+    def __init__(self, api, chassis):
+        super().__init__(api)
+        self.chassis = chassis
+        self.hostname = self.chassis.hostname.split('.')[0]
+
+    def run_idl(self, txn):
+        hcg_name= f'bgp-hcg-{self.hostname}'
+        nb_cmd.HAChassisGroupDelChassisCommand(
+            self.api,
+            hcg_name,
+            self.chassis.name).run_idl(txn)
+        nb_cmd.HAChassisGroupDelCommand(
+            self.api,
+            hcg_name).run_idl(txn)
+
+    def delete_provider_connection(self, txn):
+        pass
+
+
+class DeleteLrpConnectionCommand(nb_cmd.LrpDelCommand):
+    def run_idl(self, txn):
+        try:
+            lrp = self.api.lookup('Logical_Router_Port', self.port)
+        except idlutils.RowNotFound:
+            LOG.debug("Lrp %s not found", self.port)
+
+        lrp_peer_ports = cmd.DbFindCommand(
+            self.api,
+            'Logical_Router_Port',
+            ('peer', '=', lrp.peer),
+        ).run_idl(txn)
+        for lrp_peer_port in lrp_peer_ports:
+            nb_cmd.LrpDelCommand(
                 self.api,
-                router_name,
-                switch_name,
-                lrp_mac=lrp_mac,
-            ).run_idl(txn)
+                lrp_peer_port).run_idl(txn)
 
-            cmd.DbSetCommand(
+        lsp_peer_ports = cmd.DbFindCommand(
                 self.api,
-                'Logical_Router_Port',
-                get_lrp_name(router_name, switch_name),
-                networks=[peer_ip],
+                'Logical_Switch_Port',
+                ('options', '=', {'router-port': lrp.peer}),
             ).run_idl(txn)
-
-            # TODO(jlibosva): There are two commands to add static route
-            # 1. AddStaticRouteCommand
-            # 2. LrRouteAddCommand
-            # We need to decide which one to use
-            n_nb_commands.AddStaticRouteCommand(
+        for lsp_peer_port in lsp_peer_ports:
+            nb_cmd.LspDelCommand(
                 self.api,
-                router_name,
-                ip_prefix='0.0.0.0/0',
-                nexthop=helpers.get_ipv4_peer_address(peer_ip),
-                output_port=get_lrp_name(router_name, switch_name),
-            ).run_idl(txn)
+                lsp_peer_port).run_idl(txn)
 
-            main_router_lrp_ip = helpers.InternalIpManager.get_ip(
-                self.chassis_index, constants.LRP_MAIN_ROUTER_TO_CHASSIS)
 
-            nb_cmd.LrPolicyAddCommand(
-                self.api,
-                router_name,
-                priority=10,
-                match=f'inport==\"{get_lrp_name(router_name, switch_name)}\"',
-                action='reroute',
-                nexthops=[main_router_lrp_ip],
-                may_exist=True,
-            ).run_idl(txn)
+class AddChassisLrpMacCommand(cmd.BaseCommand):
+    def __init__(self, api, chassis, network, lrp_mac):
+        super().__init__(api)
+        self.chassis = chassis
+        self.network = network
+        self.lrp_mac = lrp_mac
+
+    def run_idl(self, txn):
+        try:
+            chassis = self.api.lookup('Chassis', self.chassis)
+        except idlutils.RowNotFound:
+            raise RuntimeError(f"Chassis {self.chassis} not found")
+
+        new_lrp_mac_map = []
+        try:
+            lrp_mac_map = chassis.external_ids[
+                constants.CHASSIS_BGP_LRP_MAC_MAP].split(',')
+        except KeyError:
+            lrp_mac_map = []
+
+        for net_mac in lrp_mac_map:
+            network, _ = net_mac.split(':', 1)
+            if network != self.network:
+                new_lrp_mac_map.append(net_mac)
+        new_lrp_mac_map.append(f'{self.network}:{self.lrp_mac}')
+
+        chassis.setkey('external_ids',
+            constants.CHASSIS_BGP_LRP_MAC_MAP,
+            ','.join(new_lrp_mac_map))

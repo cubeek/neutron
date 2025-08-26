@@ -27,15 +27,12 @@ from neutron.agent.ovn.extensions import extension_manager as ovn_ext_mgr
 from neutron.common import utils
 from neutron.services.bgp import constants
 from neutron.services.bgp.agent import events
+from neutron.services.bgp.agent import exceptions as exc
 
 LOG = log.getLogger(__name__)
 
-
-def get_bgp_bridge_names(ovs_idl):
-    """Get the names of the BGP bridges from the OVSDB"""
-    ext_ids = ovs_idl.db_get(
-        'Open_vSwitch', '.', 'external_ids').execute(check_error=True)
-    return ext_ids.get(constants.AGENT_BGP_PEER_BRIDGES, '').split(',')
+LOCALHOST_ADDRESSES = ['127.0.0.1', '::1']
+LOOPBACK_DEVICE = 'lo'
 
 
 def find_bgp_connections(source_ip_list):
@@ -59,11 +56,192 @@ def find_bgp_connections(source_ip_list):
     return list(found_peers)
 
 
+class Bridge(object):
+    def __init__(self, bgp_agent_api, name):
+        self.bgp_agent_api = bgp_agent_api
+        self.name = name
+        self.ovs_bridge = ovs_lib.OVSBridge(name)
+
+    @property
+    def ovs_idl(self):
+        return self.bgp_agent_api.agent_api.ovs_idl
+
+    @property
+    def sb_idl(self):
+        return self.bgp_agent_api.agent_api.sb_idl
+
+    def _apply_flows_as_bundle(self, flows):
+        """Apply multiple OpenFlow rules as a bundle using temporary file"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.flows',
+                                        prefix='bgp_', delete=True) as f:
+            f.write("delete\n")
+            for flow in flows:
+                f.write(f"{flow}\n")
+            f.flush()
+
+            LOG.debug("Applying %d BGP flows as bundle to bridge %s",
+                      len(flows), self.name)
+
+            self.ovs_bridge.run_ofctl("add-flows", ["--bundle", f.name])
+
+
+class BGPBridge(Bridge):
+    @property
+    def bridge_ips(self):
+        return self.bgp_agent_api.devices_with_ips[self.name]
+
+    def get_bridge_patch_port_ofport(self):
+        """Return the ofport of the patch port of the given bridge"""
+        for iface in self.bridge_ifaces():
+            if iface['type'] == 'patch':
+                return iface['ofport']
+        raise ValueError(
+            f"Expected 1 patch port for bridge {self.name}")
+
+    def bridge_ifaces(self):
+        ifaces = self.ovs_bridge.get_iface_name_list()
+        return self.ovs_idl.db_list(
+            'Interface', ifaces, if_exists=True).execute(check_error=True)
+
+    def get_bridge_nic_ofport(self):
+        """Return the ofport of the NIC of the given bridge"""
+        for iface in self.bridge_ifaces():
+            if iface['type'] not in ('patch', 'internal'):
+                return iface['ofport']
+        raise exc.BridgeNicException(f"Expected a NIC for bridge {self.name}")
+
+    def get_bgp_connection_tuple(self):
+        """Get the peer IPs of the chassis in the SB table"""
+        found_peers = find_bgp_connections(self.bridge_ips)
+        LOG.debug("Found BGP connection peers: %s", found_peers)
+
+        peer_connections = None
+        if len(found_peers) > 1:
+            LOG.warning("Found multiple connections from BGP bridge %s, using"
+                        " IPv4", self.name)
+            peer_connections = [conn for conn in found_peers
+                                if netaddr.IPAddress(conn[0]).version == 4][0]
+        elif len(found_peers) == 0:
+            LOG.warning("No connections found from BGP bridge %s", self.name)
+        else:
+            peer_connections = found_peers[0]
+
+        if peer_connections:
+            return peer_connections
+        raise RuntimeError(f"No BGP connection found for {self.name}")
+
+    def get_chassis_peer_connections_str(self):
+        peer_connections = self.get_bgp_connection_tuple()
+        return f'{self.name}:{peer_connections[0]}:{peer_connections[1]}'
+
+    @property
+    def host_ips(self):
+        """Loopback IPs and the BGP peer ip"""
+        ips = self.bgp_agent_api.devices_with_ips[self.name]
+        if LOOPBACK_DEVICE in self.bgp_agent_api.devices_with_ips:
+            ips.extend(self.bgp_agent_api.devices_with_ips[LOOPBACK_DEVICE])
+        LOG.debug("XXX host IPs for %s: %s", self.name, ips)
+        return ips
+
+    @utils.throttler()
+    def configure_flows(self):
+        """Add BGP-specific OpenFlow rules using bundle from temporary file"""
+        # The resulting openflows rules that will be written to a temporary
+        # file and applied to the bridge.
+        LOG.debug("XXX configuring BGP bridge flows for %s", self.name)
+        flows = []
+        try:
+            nic_ofport = self.get_bridge_nic_ofport()
+        except exc.BridgeNicException:
+            LOG.warning("No NIC found for %s, clearing flows", self.name)
+            self.ovs_bridge.run_ofctl("del-flows", [])
+            return
+
+        # Direct traffic meant for the host IPs
+        for host_ip in self.host_ips:
+            if host_ip.version == 4:
+                flows.append(f"priority=100,ip,in_port={nic_ofport},"
+                             f"nw_dst={host_ip.ip} actions=NORMAL")
+            elif host_ip.version == 6:
+                flows.append(f"priority=100,ipv6,in_port={nic_ofport},"
+                             f"ipv6_dst={host_ip.ip} actions=NORMAL")
+
+        # Allow ARP and ICMPv6
+        flows.extend([
+            "priority=100,arp actions=NORMAL",
+            "priority=100,icmp6,icmp_type=133 actions=NORMAL",
+            "priority=100,icmp6,icmp_type=134 actions=NORMAL",
+            "priority=100,icmp6,icmp_type=135 actions=NORMAL",
+            "priority=100,icmp6,icmp_type=136 actions=NORMAL",
+
+            # Allow IPv6 link-local traffic
+            f"priority=100,ipv6,in_port={nic_ofport},ipv6_dst=fe80::/64 "
+            "actions=NORMAL",
+
+            # Allow all other traffic
+            "priority=0, actions=normal"
+        ])
+
+        # We need to get the MAC of the LRP linked to this bridge so we can
+        # steer the incoming traffic to OVN, the server stores it to the
+        # Chassis table
+        chassis_name = ovsdb.get_own_chassis_name(self.ovs_idl)
+        ext_ids = self.sb_idl.db_get(
+            'Chassis', chassis_name,
+            'external_ids').execute(check_error=True)
+        try:
+            lrp_mac_map = ext_ids[constants.CHASSIS_BGP_LRP_MAC_MAP].split(',')
+        except KeyError:
+            lrp_mac_map = []
+        for lrp_mac in lrp_mac_map:
+            chassis_bridge_name, lrp_mac = lrp_mac.split(':', 1)
+            if chassis_bridge_name == self.name:
+                patch_port_ofport = self.get_bridge_patch_port_ofport()
+                flows.append(
+                    f"priority=80,in_port={nic_ofport},"
+                    f"actions=mod_dl_dst:{lrp_mac},output:{patch_port_ofport}")
+
+        try:
+            self._apply_flows_as_bundle(flows)
+        except Exception as e:
+            LOG.error("Failed to configure BGP flows on bridge %s: %s",
+                      self.name, e)
+
+
+class ConnectingBridge(Bridge):
+    def configure_flows(self):
+        """The method ensures the right flows for connecting BGP and Neutron."""
+        LOG.debug("XXX Configuring connecting bridge flows for %s", self.name)
+        ports = self.ovs_bridge.get_bridge_patch_ports_ofports()
+        if len(ports) != 2:
+            LOG.debug("Expected 2 ports for %s, got %d, clearing flows",
+                      self.name, len(ports))
+            self.ovs_bridge.run_ofctl("del-flows", [])
+            return
+        patch_port_ofport = ports[0]
+        other_port_ofport = ports[1]
+
+        if not patch_port_ofport or not other_port_ofport:
+            LOG.debug("No patch ports found for %s, clearing flows",
+                      self.name)
+            self.ovs_bridge.run_ofctl("del-flows", [])
+            return
+
+        flows = [
+            f"priority=100,in_port={patch_port_ofport},"
+            f"actions=output:{other_port_ofport}",
+
+            f"priority=100,in_port={other_port_ofport},"
+            f"actions=output:{patch_port_ofport}",
+        ]
+        self._apply_flows_as_bundle(flows)
+
+
 class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
     def __init__(self):
         super().__init__()
-        self.managed_devices = {}
-        self.bgp_bridges = []
+        self.devices_with_ips = {}
+        self.bgp_bridges = {}
         self._is_started_event = threading.Event()
 
     @property
@@ -99,19 +277,53 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
     @property
     def sb_idl_events(self):
         return [
+            events.CreateChassisEvent,
             events.UpdateChassisEvent,
         ]
 
     def start(self):
         self._is_started_event.clear()
-        self.bgp_bridges = get_bgp_bridge_names(self.agent_api.ovs_idl)
-        self.managed_devices = self._load_devices()
+        self.create_bgp_bridges()
+        self.devices_with_ips = self._load_devices_with_ips()
         super().start()
         self._is_started_event.set()
 
+    def get_connecting_bridge(self, name):
+        if not hasattr(self, '_connecting_bridge'):
+            self._connecting_bridge = ConnectingBridge(self, name)
+        return self._connecting_bridge
+
+    @property
+    def bgp_bridges_names(self):
+        return list(self.bgp_bridges.keys())
+
     @property
     def managed_devices_names(self):
-        return ['lo'] + self.bgp_bridges
+        return ['lo'] + self.bgp_bridges_names
+
+    def create_bgp_bridges(self):
+        """Create a list of BGP bridges objects"""
+        self.bgp_bridges = {
+            name: BGPBridge(self, name)
+            for name in self.agent_api.ovs_idl.db_get(
+                'Open_vSwitch', '.', 'external_ids').execute(check_error=True)
+            .get(constants.AGENT_BGP_PEER_BRIDGES, '').split(',')
+        }
+
+    def update_chassis_external_ids(self, external_ids):
+        """Update the chassis external IDs"""
+        LOG.debug("XXX updating chassis external IDs to %s", external_ids)
+        self.agent_api.sb_idl.db_set(
+            'Chassis', ovsdb.get_own_chassis_name(self.agent_api.ovs_idl),
+            external_ids=external_ids).execute(check_error=True)
+
+    def update_chassis_peer_connections(self):
+        """Update the chassis external IDs with the peer connections"""
+        peer_connections = [br.get_chassis_peer_connections_str()
+                            for br in self.bgp_bridges.values()]
+        self.update_chassis_external_ids({
+            constants.CHASSIS_PEER_CONNECTIONS: ','.join(peer_connections)
+        })
 
     def remove_bgp_bridge_mappings(self, bgp_peer_bridges, ovn_bridge_mappings):
         new_mappings = [m for m in ovn_bridge_mappings
@@ -121,167 +333,44 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
 
     def configure_bgp_bridge_mappings(
             self, bgp_peer_bridges, ovn_bridge_mappings):
-        self._ensure_bgp_bridge_configured_in_ovn(
-            bgp_peer_bridges, ovn_bridge_mappings)
-
-    def _ensure_bgp_bridge_configured_in_ovn(
-            self, bgp_peer_bridges, ovn_bridge_mappings):
-        chassis_peer_connections = list()
         for bgp_bridge_name in bgp_peer_bridges:
             bgp_bridge_mapping = f'{bgp_bridge_name}:{bgp_bridge_name}'
             if bgp_bridge_mapping not in ovn_bridge_mappings:
                 ovn_bridge_mappings.append(bgp_bridge_mapping)
-            peer_connection = self.get_sb_chassis_peer_connections(bgp_bridge_name)
-            if peer_connection:
-                chassis_peer_connections.append(peer_connection)
-            self.configure_bgp_bridge_flows(bgp_bridge_name)
         ovsdb.set_ovn_bridge_mapping(
             self.agent_api.ovs_idl, ovn_bridge_mappings)
-        self.agent_api.sb_idl.db_set(
-            'Chassis', ovsdb.get_own_chassis_name(self.agent_api.ovs_idl),
-            external_ids={constants.CHASSIS_PEER_CONNECTIONS: ','.join(chassis_peer_connections)}
-        ).execute(check_error=True)
 
-    @utils.throttler()
-    def configure_bgp_bridge_flows(self, bridge_name):
-        """Add BGP-specific OpenFlow rules using bundle from temporary file"""
-        # The resulting openflows rules that will be written to a temporary
-        # file and applied to the bridge.
-        bridge = ovs_lib.OVSBridge(bridge_name)
-        flows = []
-        nic_ofport = ovsdb.get_bridge_nic_ofport(
-            self.agent_api.ovs_idl, bridge.br_name)
+    def configure_chassis_bgp_bridges(self):
+        for bgp_bridge in self.bgp_bridges.values():
+            bgp_bridge.configure_flows()
 
-        # Direct traffic meant for the host IPs
-        for host_ip in self.managed_devices[bridge.br_name]:
-            if host_ip.version == 4:
-                flows.append(f"priority=100,ip,in_port={nic_ofport},"
-                             f"nw_dst={host_ip.ip} actions=NORMAL")
-            elif host_ip.version == 6:
-                flows.append(f"priority=100,ipv6,in_port={nic_ofport},"
-                             f"ipv6_dst={host_ip.ip} actions=NORMAL")
+    def _load_devices_with_ips(self):
+        """Load the devices with IPs
 
-        # Allow ARP and ICMPv6
-        flows.extend([
-            "priority=100,arp actions=NORMAL",
-            "priority=100,icmp6,icmp_type=133 actions=NORMAL",
-            "priority=100,icmp6,icmp_type=134 actions=NORMAL",
-            "priority=100,icmp6,icmp_type=135 actions=NORMAL",
-            "priority=100,icmp6,icmp_type=136 actions=NORMAL",
-
-            # Allow IPv6 link-local traffic
-            f"priority=100,ipv6,in_port={nic_ofport},ipv6_dst=fe80::/64 "
-            "actions=NORMAL",
-
-            # Allow all other traffic
-            "priority=0, actions=normal"
-        ])
-
-        # We need to get the MAC of the LRP linked to this bridge so we can
-        # steer the incoming traffic to OVN, the server stores it to the
-        # Chassis table
-        chassis_name = ovsdb.get_own_chassis_name(self.agent_api.ovs_idl)
-        ext_ids = self.agent_api.sb_idl.db_get(
-            'Chassis', chassis_name,
-            'external_ids').execute(check_error=True)
-        try:
-            lrp_mac_map = ext_ids[constants.CHASSIS_BGP_LRP_MAC_MAP].split(',')
-        except KeyError:
-            lrp_mac_map = []
-        for lrp_mac in lrp_mac_map:
-            chassis_bridge_name, lrp_mac = lrp_mac.split(':')
-            if chassis_bridge_name == bridge_name:
-                patch_port_ofport = ovsdb.get_bridge_patch_port_ofport(
-                    self.agent_api.ovs_idl, chassis_bridge_name)
-                flows.append(
-                    f"priority=80,in_port={nic_ofport},"
-                    f"actions=mod_dl_dst:{lrp_mac},output:{patch_port_ofport}")
-
-        try:
-            self._apply_flows_as_bundle(bridge, flows)
-        except Exception as e:
-            LOG.error("Failed to configure BGP flows on bridge %s: %s",
-                      bridge_name, e)
-
-    def _apply_flows_as_bundle(self, bridge, flows):
-        """Apply multiple OpenFlow rules as a bundle using temporary file"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.flows',
-                                        prefix='bgp_', delete=True) as f:
-            f.write("delete\n")
-            for flow in flows:
-                f.write(f"{flow}\n")
-            f.flush()
-
-            LOG.debug("Applying %d BGP flows as bundle to bridge %s",
-                      len(flows), bridge.br_name)
-
-            bridge.run_ofctl("add-flows", ["--bundle", f.name])
-
-    def _load_devices(self):
+        Loads the bridges configured in OVS bgp-bridges and loopback addresses.
+        The localhost addresses are skipped.
+        """
         devices_map = {}
         devices = ip_lib.get_devices_with_ip(namespace=None)
         for device in devices:
             if device['name'] in self.managed_devices_names:
-                devices_map.setdefault(device['name'], []).append(
-                    netaddr.IPNetwork(device['cidr']))
+                ip = netaddr.IPNetwork(device['cidr'])
+                if str(ip.ip) not in LOCALHOST_ADDRESSES:
+                    devices_map.setdefault(device['name'], []).append(
+                        netaddr.IPNetwork(device['cidr']))
         LOG.debug("XXX Loaded devices: %s", devices_map)
         return devices_map
 
-    def get_sb_chassis_peer_connections(self, bridge_name):
-        """Configure the peer IPs of the chassis in the SB table"""
-        LOG.debug("XXX Configuring chassis peer connections for %s", bridge_name)
-        chassis_peer_ips = self.managed_devices[bridge_name]
-        found_peers = find_bgp_connections(chassis_peer_ips)
-        LOG.debug("XXX Found peers: %s", found_peers)
+    @property
+    def host_ips(self):
+        return [ip for ips in self.devices_with_ips.values() for ip in ips]
 
-        peer_connections = None
-        if len(found_peers) > 1:
-            LOG.warning("Found multiple connections from BGP bridge %s, using"
-                        " IPv4", bridge_name)
-            peer_connections = [conn for conn in found_peers
-                                if netaddr.IPAddress(conn[0]).version == 4][0]
-        elif len(found_peers) == 0:
-            LOG.warning("No connections found from BGP bridge %s", bridge_name)
-        else:
-            peer_connections = found_peers[0]
-
-        if peer_connections:
-            conn_str = (f'{bridge_name}:{peer_connections[0]}:'
-                        f'{peer_connections[1]}')
-            return conn_str
-
-    def handle_patch_port(self, port_name):
-        LOG.debug("XXX Handling patch port %s", port_name)
-        bridge_name = self.agent_api.ovs_idl.iface_to_br(
-            port_name).execute(check_error=True)
-        br_int = self.agent_api.ovs_idl.db_get(
-            'Open_vSwitch', '.', 'external_ids').execute(check_error=True).get(
-                'ovn-bridge'
-            )
-        LOG.debug("XXX Bridge name: %s, br_int: %s", bridge_name, br_int)
-
+    def handle_patch_ports(self, bridge_name):
         if bridge_name in self.bgp_bridges:
-            self.configure_bgp_bridge_flows(bridge_name)
-        elif br_int == bridge_name:
-            # Do not touch the integration bridge
-            pass
+            bridge = self.bgp_bridges[bridge_name]
         else:
-            # This must be the bridge connecting OVN and BGP
-            self.configure_connecting_bridge_flows(bridge_name)
+            # If it's not a BGP bridge, it must be the bridge connecting OVN
+            bridge = self.get_connecting_bridge(bridge_name)
 
-    @utils.throttler()
-    def configure_connecting_bridge_flows(self, bridge_name):
-        bridge = ovs_lib.OVSBridge(bridge_name)
-        ports = bridge.get_bridge_patch_ports_ofports()
-        if len(ports) != 2:
-            LOG.debug("Expected 2 ports for %s, got %d, clearing flows",
-                      bridge_name, len(ports))
-            bridge.run_ofctl("del-flows", [bridge_name])
-            return
-        patch_port_ofport = ports[0]
-        other_port_ofport = ports[1]
-        flows = [
-            f"priority=100,in_port={patch_port_ofport},actions=output:{other_port_ofport}",
-            f"priority=100,in_port={other_port_ofport},actions=output:{patch_port_ofport}",
-        ]
-        self._apply_flows_as_bundle(bridge, flows)
+        bridge.configure_flows()
+

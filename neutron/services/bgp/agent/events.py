@@ -20,6 +20,7 @@ from neutron.services.bgp import constants
 
 LOG = log.getLogger(__name__)
 
+
 def get_bgp_peer_bridges(row):
     try:
         return row.external_ids[constants.AGENT_BGP_PEER_BRIDGES].split(',')
@@ -35,7 +36,10 @@ class BGPAgentEvent(row_event.RowEvent):
     def __init__(self, agent_api):
         self.agent_api = agent_api
         super().__init__(self.EVENTS, self.TABLE, None)
-        self.event_name = self.__class__.__name__
+
+    @property
+    def event_name(self):
+        return self.__class__.__name__
 
     @property
     def bgp_agent(self):
@@ -58,10 +62,8 @@ class CreateLocalOVSEvent(LocalOVSEvent):
 
     def __init__(self, agent_api):
         super().__init__(agent_api)
-        self.event_name = self.__class__.__name__
 
     def match_fn(self, event, row, old):
-
         if constants.AGENT_BGP_PEER_BRIDGES not in row.external_ids:
             LOG.warning("Chassis %s does not have BGP configuration but the "
                         "BGP extension is enabled", self.agent_api.chassis)
@@ -81,7 +83,6 @@ class UpdateLocalOVSEvent(LocalOVSEvent):
 
     def __init__(self, agent_api):
         super().__init__(agent_api)
-        self.event_name = self.__class__.__name__
 
     def match_fn(self, event, row, old):
         try:
@@ -110,29 +111,54 @@ class UpdateLocalOVSEvent(LocalOVSEvent):
             self.bgp_agent.remove_bgp_bridge_mappings(
                 list(removed_bridges), ovn_bridge_mappings)
 
+        self.bgp_agent.create_bgp_bridges()
+        self.bgp_agent.update_chassis_peer_connections()
+
 
 class PatchPortEvent(BGPAgentEvent):
     """Base class for patch port events."""
-    TABLE = 'Interface'
-    EVENTS = (BGPAgentEvent.ROW_CREATE, BGPAgentEvent.ROW_DELETE)
+    TABLE = 'Bridge'
+    EVENTS = (BGPAgentEvent.ROW_UPDATE, BGPAgentEvent.ROW_CREATE)
 
     def __init__(self, agent_api):
         super().__init__(agent_api)
-        self.event_name = self.__class__.__name__
 
     def match_fn(self, event, row, old):
-        return row.type == 'patch'
+        if not super().match_fn(event, row, old):
+            return False
+
+        br_int = self.agent_api.ovs_idl.db_get(
+            'Open_vSwitch', '.', 'external_ids').execute(check_error=True).get(
+                'ovn-bridge'
+            )
+        if row.name == br_int:
+            return False
+
+        if event == self.ROW_CREATE:
+            # Likely an agent restart
+            return True
+
+        cur_ports = set(row.ports)
+        old_ports = set(old.ports)
+
+        return cur_ports != old_ports
+
 
     def run(self, event, row, old):
-        self.bgp_agent.handle_patch_port(row.name)
+        self.bgp_agent.handle_patch_ports(row.name)
 
 
 class BGPChassisEvent(BGPAgentEvent):
     """Base class for BGP chassis events."""
     TABLE = 'Chassis'
 
+    def run(self, event, row, old):
+        self.bgp_agent.configure_chassis_bgp_bridges()
+        self.bgp_agent.update_chassis_peer_connections()
+
 
 class CreateChassisEvent(BGPChassisEvent):
+    """New chassis that already has LRP MAC map configured."""
     EVENTS = (BGPChassisEvent.ROW_CREATE,)
 
 
@@ -141,21 +167,18 @@ class UpdateChassisEvent(BGPChassisEvent):
 
     def __init__(self, agent_api):
         super().__init__(agent_api)
-        self.event_name = self.__class__.__name__
 
     def match_fn(self, event, row, old):
+        LOG.debug("XXX UpdateChassisEvent %s %s %s", event, row, old)
         if not super().match_fn(event, row, old):
             return False
         if not hasattr(old, 'external_ids'):
             return False
         try:
-            current_lrp_mac_map = row.external_ids[constants.CHASSIS_BGP_LRP_MAC_MAP]
+            current_lrp_mac_map = row.external_ids[
+                constants.CHASSIS_BGP_LRP_MAC_MAP]
             old_lrp_mac_map = old.external_ids[constants.CHASSIS_BGP_LRP_MAC_MAP]
         except KeyError:
             return False
 
         return current_lrp_mac_map != old_lrp_mac_map
-
-    def run(self, event, row, old):
-        self.bgp_agent.configure_sb_chassis_lrp_mac_map(
-            row.external_ids[constants.CHASSIS_BGP_LRP_MAC_MAP])

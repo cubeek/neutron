@@ -13,17 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron_lib.plugins import directory
 from neutron_lib.services import base as service_base
-from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
-from neutron_lib.callbacks import resources
 from oslo_config import cfg
 from oslo_log import log
 
-from neutron.plugins.ml2 import plugin as ml2_plugin
 from neutron.services.bgp import config
-from neutron.services.bgp import reconciler
 from neutron.services.bgp import worker
 
 LOG = log.getLogger(__name__)
@@ -40,9 +35,7 @@ class BGPServicePlugin(service_base.ServicePluginBase):
         config.register_opts(cfg.CONF)
 
     def get_workers(self):
-        workers = [worker.BGPWorker()]
-
-        return workers
+        return [worker.BGPWorker()]
 
     def get_plugin_description(self):
         return "BGP service plugin for OVN"

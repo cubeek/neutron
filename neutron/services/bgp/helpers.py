@@ -112,58 +112,28 @@ def get_all_chassis(sb_ovn):
     return chassis
 
 
-def get_chassis_provider_networks(chassis):
-    return [
-        bm.split(':')[0]
-        for bm in chassis.other_config.get(
-            'ovn-bridge-mappings').split(',')
-        if bm.startswith('bgp-')]
-
-
 def get_chassis_bgp_peer_mapping(chassis):
-    for options in chassis.other_config.get('ovn-cms-options', '').split(','):
-        if options.split('=')[0] == constants.OVN_BGP_PEERS_KEY:
-            bgp_peers = options.split('=')[1].split(';')
-            break
-    else:
-        raise RuntimeError(f"Chassis {chassis.name} has no BGP peer mapping")
-
+    bgp_peer_mapping = {}
     try:
-        bgp_peer_mapping = {network_name: peer_ip
-            for network_name, peer_ip in (
-                bm.split(':', 1) for bm in bgp_peers
-            )
-        }
-    except ValueError:
-        raise RuntimeError(f"BGP peer mapping {bgp_peers} is not valid")
+        connections = chassis.external_ids[
+            constants.CHASSIS_PEER_CONNECTIONS].split(',')
+    except KeyError:
+        LOG.warning("Chassis %s has no BGP connection", chassis.name)
+        return bgp_peer_mapping
 
-    for ip in bgp_peer_mapping.values():
+    for connection in connections:
+        network_name, source_ip, peer_ip = connection.split(':')
+
         try:
-            netaddr.IPAddress(ip)
+            source_ip = netaddr.IPAddress(source_ip)
+            peer_ip = netaddr.IPAddress(peer_ip)
         except netaddr.core.AddrFormatError:
-            raise RuntimeError(f"BGP peer IP {ip} is not a valid address")
+            LOG.warning("Invalid BGP peer mapping %s for chassis %s",
+                        connection, chassis.name)
+            continue
+        bgp_peer_mapping[network_name] = (source_ip, peer_ip)
 
     return bgp_peer_mapping
-
-
-def get_ipv4_peer_address(ip_address):
-    try:
-        ip_net = netaddr.IPNetwork(f"{ip_address}/30")
-    except netaddr.core.AddrFormatError:
-        raise ValueError(f"Invalid IPv4 address: {ip_address}")
-
-    network = ip_net.network
-
-    first_host = network + 1
-    second_host = network + 2
-
-    if ip_net.ip == first_host:
-        return str(second_host)
-    elif ip_net.ip == second_host:
-        return str(first_host)
-    else:
-        raise RuntimeError(f"Address {ip_net.ip} is not a usable host address "
-                           f"in the /30 network {network}/30")
 
 
 class InternalIpManager:

@@ -157,36 +157,6 @@ def set_ovn_bridge_mapping(ovs_idl, bridge_mapping):
     ).execute(check_error=True)
 
 
-def get_bridge_nic_ofport(ovs_idl, bridge_name):
-    """Return the ofport of the NIC of the given bridge"""
-    ifaces = ovs_idl.list_ifaces(bridge_name).execute(check_error=True)
-    for iface in ifaces:
-        found_ifaces = ovs_idl.db_list(
-            'Interface', iface, if_exists=True).execute(check_error=True)
-        if len(found_ifaces) != 1:
-            raise RuntimeError(f"Expected 1 interface with name {iface}, "
-                               f"got {len(found_ifaces)}")
-        iface_dict = found_ifaces[0]
-        if iface_dict['type'] not in ('patch', 'internal'):
-            return iface_dict['ofport']
-    raise ValueError(
-        f"Expected 1 NIC for bridge {bridge_name}, got {len(ifaces)}")
-
-
-def get_bridge_patch_port_ofport(ovs_idl, bridge_name):
-    """Return the ofport of the patch port of the given bridge"""
-    ifaces = ovs_idl.list_ifaces(bridge_name).execute(check_error=True)
-    for iface in ifaces:
-        found_ifaces = ovs_idl.db_list(
-            'Interface', iface, if_exists=True).execute(check_error=True)
-        if len(found_ifaces) != 1:
-            raise RuntimeError(f"Expected 1 interface with name {iface}, "
-                               f"got {len(found_ifaces)}")
-        iface_dict = found_ifaces[0]
-        if iface_dict['type'] == 'patch':
-            return iface_dict['ofport']
-    raise ValueError(
-        f"Expected 1 patch port for bridge {bridge_name}, got {len(ifaces)}")
 
 
 def get_port_qos(nb_idl, port_id):

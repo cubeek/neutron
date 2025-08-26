@@ -20,6 +20,7 @@ from ovsdbapp.schema.ovn_southbound import impl_idl as sb_impl_idl
 from ovsdbapp import event
 
 from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import ovsdb_monitor
+from neutron.services.bgp import commands
 
 OVN_NB_TABLES = (
     'Logical_Switch', 'Logical_Switch_Port',
@@ -59,9 +60,13 @@ class BgpOvnNbIdl(nb_impl_idl.OvnNbApiIdlImpl):
     def has_lock(self):
         return not self.ovsdb_connection.idl.is_lock_contended
 
+    def register_events(self, events):
+        self.ovsdb_connection.idl.notify_handler.watch_events(events)
+
 
 class BgpOvnSbIdl(sb_impl_idl.OvnSbApiIdlImpl):
-    pass
+    def register_events(self, events):
+        self.ovsdb_connection.idl.notify_handler.watch_events(events)
 
 
 class OvnNbIdl(OvnIdl):
@@ -74,3 +79,9 @@ class OvnSbIdl(OvnIdl):
     SCHEMA = 'OVN_Southbound'
     tables = OVN_SB_TABLES
     api_cls = BgpOvnSbIdl
+
+    def get_chassis(self, chassis_uuid):
+        return commands.GetChassisCommand(
+            self,
+            chassis_uuid,
+        )
