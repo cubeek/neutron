@@ -22,3 +22,6 @@ LR_OPTIONS_DYNAMIC_ROUTING_REDISTRIBUTE = 'dynamic-routing-redistribute'
 LR_OPTIONS_DYNAMIC_ROUTING_VRF_ID = 'dynamic-routing-vrf-id'
 
 HA_CHASSIS_GROUP_PRIORITY = 10
+BGP_BRIDGES_EXT_ID_KEY = 'bgp-bridges'
+
+BGP_CHASSIS_NETWORK_NAME = 'bgp-chassis-network-name'

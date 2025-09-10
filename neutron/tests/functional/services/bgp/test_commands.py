@@ -20,6 +20,7 @@ from oslo_utils import uuidutils
 from ovsdbapp.backend.ovs_idl import idlutils
 
 from neutron.services.bgp import commands
+from neutron.services.bgp import constants
 from neutron.services.bgp import exceptions
 from neutron.services.bgp import helpers
 from neutron.tests.functional.services import bgp
@@ -104,10 +105,45 @@ class _AddBaseCommand:
         row = self._assert_table_row_exists(name)
 
 
+class LsAddCommandTestCase(bgp.BaseBgpNbIdlTestCase, _AddBaseCommand):
+    table = 'Logical_Switch'
+    command = commands._LsAddCommand
+
+
 class LrAddCommandTestCase(bgp.BaseBgpNbIdlTestCase,
                            _AddBaseCommand):
     table = 'Logical_Router'
     command = commands._LrAddCommand
+
+
+class LspAddCommandTestCase(bgp.BaseBgpNbIdlTestCase, _AddBaseCommand):
+    table = 'Logical_Switch_Port'
+    command = commands._LspAddCommand
+
+    def setUp(self):
+        super().setUp()
+        self.ls_name = _get_unique_name()
+        self.nb_api.ls_add(self.ls_name).execute(check_error=True)
+
+    def create_row(self, name, **kwargs):
+        return self.command(self.nb_api, self.ls_name, name, **kwargs).execute(
+            check_error=True)
+
+    def test_create_existing_with_different_attributes(self):
+        name = _get_unique_name()
+        self.create_row(
+            name, options={'peer-port': 'lsp-peer-1'},
+            external_ids={'id1': 'value1'})
+        lsp = self._assert_table_row_exists(name)
+        self.assertEqual(lsp.options.get('peer-port'), 'lsp-peer-1')
+        self.assertEqual(lsp.external_ids.get('id1'), 'value1')
+
+        # Should update the options
+        self.create_row(name, options={'peer-port': 'lsp-peer-2'},
+                        external_ids={'id1': 'value2'})
+        lsp = self._assert_table_row_exists(name)
+        self.assertEqual(lsp.options.get('peer-port'), 'lsp-peer-2')
+        self.assertEqual(lsp.external_ids.get('id1'), 'value2')
 
 
 class LrpAddCommandTestCase(bgp.BaseBgpNbIdlTestCase, _AddBaseCommand):
@@ -151,6 +187,129 @@ class HAChassisGroupAddCommandTestCase(bgp.BaseBgpNbIdlTestCase,
                                        _AddBaseCommand):
     table = 'HA_Chassis_Group'
     command = commands._HAChassisGroupAddCommand
+
+
+class CreateSwitchWithLocalnetCommandTestCase(bgp.BaseBgpNbIdlTestCase):
+    def _validate_localnet_port(self, ls_name, network_name):
+        """Validate localnet port was created correctly"""
+        localnet_lsp_name = helpers.get_lsp_localnet_name(ls_name)
+        lsp = self.nb_api.lookup('Logical_Switch_Port', localnet_lsp_name)
+        self.assertEqual(lsp.type, 'localnet')
+        self.assertEqual(lsp.options.get('network_name'), network_name)
+        self.assertEqual(lsp.addresses, ['unknown'])
+
+    def _create_lsp(self, ls_name, lsp_name, **attrs):
+        """Helper to create LSP with wrong attributes"""
+        self.nb_api.lsp_add(ls_name, lsp_name, **attrs).execute(
+            check_error=True)
+
+    def test_create_new_switch_with_localnet(self):
+        ls_name = _get_unique_name()
+        network_name = 'test-network'
+
+        commands.CreateSwitchWithLocalnetCommand(
+            self.nb_api, ls_name, network_name).execute(check_error=True)
+
+        ls = self.nb_api.ls_get(ls_name).execute(check_error=True)
+        self.assertEqual(ls.name, ls_name)
+
+        self._validate_localnet_port(ls_name, network_name)
+
+    def test_create_existing_switch_updates_localnet(self):
+        ls_name = _get_unique_name()
+        network_name = 'test-network'
+
+        # Create switch first
+        self.nb_api.ls_add(ls_name).execute(check_error=True)
+
+        # Execute command
+        commands.CreateSwitchWithLocalnetCommand(
+            self.nb_api, ls_name, network_name).execute(check_error=True)
+
+        # Verify localnet port was created even with existing switch
+        self._validate_localnet_port(ls_name, network_name)
+
+    def test_create_with_existing_localnet_wrong_attributes(self):
+        """Test corner case where localnet port exists with wrong attributes"""
+        ls_name = _get_unique_name()
+        network_name = 'test-network'
+
+        # Create switch and localnet port with wrong attributes
+        self.nb_api.ls_add(ls_name).execute(check_error=True)
+        localnet_lsp_name = helpers.get_lsp_localnet_name(ls_name)
+        self._create_lsp(
+            ls_name, localnet_lsp_name,
+            type='patch',  # wrong type
+            options={'wrong': 'value'},  # wrong options
+            addresses=['00:00:00:00:00:01']  # wrong addresses
+        )
+
+        # Execute command should fix the attributes
+        commands.CreateSwitchWithLocalnetCommand(
+            self.nb_api, ls_name, network_name).execute(check_error=True)
+
+        # Verify attributes were corrected
+        self._validate_localnet_port(ls_name, network_name)
+
+
+class CreateLspLocalnetCommandTestCase(bgp.BaseBgpNbIdlTestCase):
+    def _validate_localnet_port(self, ls_name, network_name):
+        """Validate localnet port was created correctly"""
+        localnet_lsp_name = helpers.get_lsp_localnet_name(ls_name)
+        lsp = self.nb_api.lookup('Logical_Switch_Port', localnet_lsp_name)
+        self.assertEqual(lsp.type, 'localnet')
+        self.assertEqual(lsp.options.get('network_name'), network_name)
+        self.assertEqual(lsp.addresses, ['unknown'])
+        return lsp
+
+    def _create_lsp(self, ls_name, lsp_name, **attrs):
+        self.nb_api.lsp_add(ls_name, lsp_name, **attrs).execute(
+            check_error=True)
+
+    def setUp(self):
+        super().setUp()
+        self.ls_name = _get_unique_name()
+        self.nb_api.ls_add(self.ls_name).execute(check_error=True)
+
+    def test_create_localnet_port(self):
+        network_name = 'test-network'
+
+        commands.CreateLspLocalnetCommand(
+            self.nb_api, self.ls_name, network_name).execute(check_error=True)
+
+        self._validate_localnet_port(self.ls_name, network_name)
+
+    def test_update_existing_localnet_with_different_network(self):
+        network_name1 = 'test-network-1'
+        network_name2 = 'test-network-2'
+
+        # Create first localnet port
+        commands.CreateLspLocalnetCommand(
+            self.nb_api, self.ls_name, network_name1).execute(check_error=True)
+
+        # Update with different network name
+        commands.CreateLspLocalnetCommand(
+            self.nb_api, self.ls_name, network_name2).execute(check_error=True)
+
+        # Verify network name was updated
+        self._validate_localnet_port(self.ls_name, network_name2)
+
+    def test_fix_localnet_with_wrong_type_and_options(self):
+        network_name = 'test-network'
+        localnet_lsp_name = helpers.get_lsp_localnet_name(self.ls_name)
+
+        self._create_lsp(
+            self.ls_name, localnet_lsp_name,
+            type='router',  # wrong type
+            options={'router-port': 'wrong'},  # wrong options
+            addresses=['router']  # wrong addresses
+        )
+
+        commands.CreateLspLocalnetCommand(
+            self.nb_api, self.ls_name, network_name).execute(check_error=True)
+
+        lsp = self._validate_localnet_port(self.ls_name, network_name)
+        self.assertNotIn('router-port', lsp.options)
 
 
 class ReconcileRouterCommandTestCase(bgp.BaseBgpNbIdlTestCase):
@@ -367,10 +526,97 @@ class ConnectChassisRouterToMainRouterCommandTestCase(
         )
 
 
-class ReconcileChassisCommandTestCase(bgp.BaseBgpTestCase):
-    PeerConnectionAttributes = namedtuple('PeerConnectionAttributes',
-                                          ['lrp_name', 'lrp_ip', 'switch_ip'])
+class ConnectRouterToSwitchCommandTestCase(bgp.BaseBgpNbIdlTestCase):
+    def setUp(self):
+        super().setUp()
+        self.lr_name = _get_unique_name()
+        self.ls_name = _get_unique_name()
 
+        self.nb_api.lr_add(self.lr_name).execute(check_error=True)
+        self.nb_api.ls_add(self.ls_name).execute(check_error=True)
+
+    @bgp.requires_ovn_version_with_bgp()
+    def test_connect_router_to_switch_without_ip(self):
+        commands.ConnectRouterToSwitchCommand(
+            self.nb_api, self.lr_name, self.ls_name).execute(check_error=True)
+
+        lrp_name = helpers.get_lrp_name(self.lr_name, self.ls_name)
+        lrp = self.nb_api.lrp_get(lrp_name).execute(check_error=True)
+        self.assertEqual([], lrp.networks)
+
+        lsp_name = helpers.get_lsp_name(self.ls_name, self.lr_name)
+        lsp = self.nb_api.lsp_get(lsp_name).execute(check_error=True)
+        self.assertEqual('router', lsp.type)
+        self.assertEqual(['router'], lsp.addresses)
+        self.assertEqual(lrp_name, lsp.options.get('router-port'))
+
+    def test_connect_router_to_switch_with_ip(self):
+        lrp_ip = '192.168.1.1/24'
+
+        commands.ConnectRouterToSwitchCommand(
+            self.nb_api, self.lr_name, self.ls_name, [lrp_ip]
+        ).execute(check_error=True)
+
+        lrp_name = helpers.get_lrp_name(self.lr_name, self.ls_name)
+        lrp = self.nb_api.lrp_get(lrp_name).execute(check_error=True)
+        self.assertEqual([lrp_ip], lrp.networks)
+
+    @bgp.requires_ovn_version_with_bgp()
+    def test_connect_existing_with_different_attributes(self):
+        lrp_name = helpers.get_lrp_name(self.lr_name, self.ls_name)
+        lsp_name = helpers.get_lsp_name(self.ls_name, self.lr_name)
+
+        # Create LRP and LSP with wrong attributes
+        self.nb_api.lrp_add(
+            self.lr_name, lrp_name,
+            mac='00:00:00:00:00:01',  # wrong MAC
+            networks=['10.0.0.1/24']  # wrong networks
+        ).execute(check_error=True)
+
+        self.nb_api.lsp_add(
+            self.ls_name, lsp_name,
+            type='patch',  # wrong type
+            addresses=['00:00:00:00:00:01'],  # wrong addresses
+            options={'peer': 'wrong-peer'}  # wrong options
+        ).execute(check_error=True)
+
+        # Execute command should fix attributes
+        commands.ConnectRouterToSwitchCommand(
+            self.nb_api, self.lr_name, self.ls_name).execute(check_error=True)
+
+        # Verify attributes were corrected
+        lrp = self.nb_api.lrp_get(lrp_name).execute(check_error=True)
+        self.assertEqual([], lrp.networks)
+
+        lsp = self.nb_api.lsp_get(lsp_name).execute(check_error=True)
+        self.assertEqual('router', lsp.type)
+        self.assertEqual(['router'], lsp.addresses)
+        self.assertEqual(lrp_name, lsp.options.get('router-port'))
+
+
+class ConnectChassisRouterToSwitchCommandTestCase(bgp.BaseBgpNbIdlTestCase):
+    def setUp(self):
+        super().setUp()
+        self.lr_name = _get_unique_name()
+        self.ls_name = _get_unique_name()
+
+        self.nb_api.lr_add(self.lr_name).execute(check_error=True)
+        self.nb_api.ls_add(self.ls_name).execute(check_error=True)
+
+    def test_sets_external_ids(self):
+        network_name = _get_unique_name()
+        commands.ConnectChassisRouterToSwitchCommand(
+            self.nb_api, self.lr_name, self.ls_name, network_name
+        ).execute(check_error=True)
+
+        lrp_name = helpers.get_lrp_name(self.lr_name, self.ls_name)
+        lrp = self.nb_api.lrp_get(lrp_name).execute(check_error=True)
+        self.assertEqual(
+            network_name,
+            lrp.external_ids[constants.BGP_CHASSIS_NETWORK_NAME])
+
+
+class ReconcileChassisCommandTestCase(bgp.BaseBgpTestCase):
     def setUp(self):
         super().setUp()
         self.main_router_name = _get_unique_name()
@@ -412,6 +658,38 @@ class ReconcileChassisCommandTestCase(bgp.BaseBgpTestCase):
 
         self.assertEqual([lrp_chassis_name], lrp_main.peer)
         self.assertEqual([lrp_main_name], lrp_chassis.peer)
+
+    def _validate_chassis_router_routes(self, router, peers):
+        self.assertEqual(len(peers), len(router.static_routes))
+        self.assertEqual(len(peers), len(router.policies))
+
+        # Expected routes
+        prefix_nexthop_port_expected = [
+            ('0.0.0.0/0', peer.switch_ip, [peer.lrp_name])
+            for peer in peers
+        ]
+        # Actual routes
+        prefix_nexthop_port = [
+            (route.ip_prefix, route.nexthop, route.output_port)
+            for route in router.static_routes
+        ]
+        self.assertCountEqual(
+            prefix_nexthop_port_expected, prefix_nexthop_port)
+
+        main_router_lrp_ip = helpers.InternalIpManager.get_ip(
+            chassis_index=1, port_index=constants.LRP_MAIN_ROUTER_TO_CHASSIS)
+        # Expected policies
+        expected_policies = [
+            (f'inport==\"{peer.lrp_name}\"', 'reroute', [main_router_lrp_ip])
+            for peer in peers
+        ]
+        # Actual policies
+        actual_policies = [
+            (policy.match, policy.action, policy.nexthops)
+            for policy in router.policies
+
+        ]
+        self.assertCountEqual(expected_policies, actual_policies)
 
     def test_reconcile_chassis_basic(self):
         chassis = self._create_chassis()
