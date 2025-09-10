@@ -23,3 +23,7 @@ CHASSIS_PEER_CONNECTIONS = 'bgp-peer-connections'
 
 BGP_CHASSIS_NETWORK_NAME = 'bgp-chassis-network-name'
 BGP_CHASSIS_LRP_MAC = 'bgp-chassis-lrp-mac'
+
+AGENT_BGP_PEER_BRIDGES = 'bgp-peer-bridges'
+
+AGENT_BGP_EXT_NAME = 'ovn-bgp'
