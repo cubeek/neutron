@@ -16,6 +16,8 @@
 import netaddr
 from oslo_log import log
 
+from neutron.services.bgp import constants
+
 LOG = log.getLogger(__name__)
 
 
@@ -93,6 +95,39 @@ class LrpMacManager:
 def get_all_chassis(sb_ovn):
     chassis = sb_ovn.db_find_rows('Chassis').execute(check_error=True)
     return chassis
+
+
+def get_chassis_bgp_peer_mapping(chassis):
+    bgp_peer_mapping = {}
+    try:
+        peer_connections = chassis.external_ids[
+            constants.CHASSIS_PEER_CONNECTIONS]
+    except KeyError:
+        LOG.warning("Chassis %s has no BGP connection", chassis.name)
+        return bgp_peer_mapping
+
+    if not peer_connections:
+        LOG.warning("Chassis %s has empty BGP connection", chassis.name)
+        return bgp_peer_mapping
+
+    for connection in peer_connections.split(','):
+        try:
+            network_name, source_ip, peer_ip = connection.split(';', 3)
+        except ValueError:
+            LOG.warning("Invalid BGP peer mapping %s for chassis %s",
+                        connection, chassis.name)
+            continue
+
+        try:
+            netaddr.IPNetwork(source_ip)
+            netaddr.IPAddress(peer_ip)
+        except netaddr.core.AddrFormatError:
+            LOG.warning("Invalid BGP peer mapping %s for chassis %s",
+                        connection, chassis.name)
+            continue
+        bgp_peer_mapping[network_name] = (source_ip, peer_ip)
+
+    return bgp_peer_mapping
 
 
 class InternalIpManager:

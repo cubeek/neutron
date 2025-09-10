@@ -13,6 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
+from neutron.services.bgp import constants
 from neutron.services.bgp import helpers
 from neutron.tests import base
 
@@ -118,6 +121,91 @@ class LrpMacManagerTestCase(base.BaseTestCase):
 
         self.assertRaises(
             ValueError, self.manager.get_mac_address, router_name, -1)
+
+
+class GetChassisBgpPeerMappingTestCase(base.BaseTestCase):
+    class FakeChassis:
+        def __init__(self, name, external_ids=None):
+            self.name = name
+            self.external_ids = external_ids or {}
+
+    def setUp(self):
+        super().setUp()
+        self.chassis = self.FakeChassis('test-chassis')
+
+    def test_get_chassis_bgp_peer_mapping_valid_connections(self):
+        mapping = 'net1;192.168.1.1/30;192.168.1.2,net2;10.0.0.1/30;10.0.0.2'
+        self.chassis.external_ids = {
+            constants.CHASSIS_PEER_CONNECTIONS: mapping
+        }
+
+        result = helpers.get_chassis_bgp_peer_mapping(self.chassis)
+
+        expected = {
+            'net1': ('192.168.1.1/30', '192.168.1.2'),
+            'net2': ('10.0.0.1/30', '10.0.0.2')
+        }
+        self.assertEqual(expected, result)
+
+    def test_get_chassis_bgp_peer_mapping_no_connections(self):
+        self.chassis.external_ids = {}
+
+        with mock.patch.object(helpers, 'LOG'):
+            result = helpers.get_chassis_bgp_peer_mapping(self.chassis)
+
+        self.assertEqual({}, result)
+
+    def test_get_chassis_bgp_peer_mapping_invalid_ip_format(self):
+        mapping = 'net1;invalid-ip;192.168.1.2,net2;10.0.0.1/30;10.0.0.2'
+        self.chassis.external_ids = {
+            constants.CHASSIS_PEER_CONNECTIONS: mapping
+        }
+
+        with mock.patch.object(helpers, 'LOG'):
+            result = helpers.get_chassis_bgp_peer_mapping(self.chassis)
+
+        # Should only return valid connections
+        expected = {
+            'net2': ('10.0.0.1/30', '10.0.0.2')
+        }
+        self.assertEqual(expected, result)
+
+    def test_get_chassis_bgp_peer_mapping_malformed_connection_string(self):
+        mapping = 'net1;192.168.1.1/30,net2;10.0.0.1/30;10.0.0.2'
+        self.chassis.external_ids = {
+            constants.CHASSIS_PEER_CONNECTIONS: mapping
+        }
+
+        expected = {
+            'net2': ('10.0.0.1/30', '10.0.0.2')
+        }
+
+        with mock.patch.object(helpers, 'LOG'):
+            result = helpers.get_chassis_bgp_peer_mapping(self.chassis)
+
+        self.assertEqual(expected, result)
+
+    def test_get_chassis_bgp_peer_mapping_empty_connection_string(self):
+        self.chassis.external_ids = {constants.CHASSIS_PEER_CONNECTIONS: ''}
+
+        result = helpers.get_chassis_bgp_peer_mapping(self.chassis)
+
+        self.assertEqual({}, result)
+
+    def test_get_chassis_bgp_peer_mapping_mixed_ip_versions(self):
+        mapping = ('net1;192.168.1.1/30;192.168.1.2,'
+                   'net2;2001:db8::1/64;2001:db8::2')
+        self.chassis.external_ids = {
+            constants.CHASSIS_PEER_CONNECTIONS: mapping
+        }
+
+        result = helpers.get_chassis_bgp_peer_mapping(self.chassis)
+
+        expected = {
+            'net1': ('192.168.1.1/30', '192.168.1.2'),
+            'net2': ('2001:db8::1/64', '2001:db8::2')
+        }
+        self.assertEqual(expected, result)
 
 
 class InternalIpManagerTestCase(base.BaseTestCase):

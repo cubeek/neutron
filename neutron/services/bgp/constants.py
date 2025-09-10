@@ -17,3 +17,9 @@ OVN_BGP_CHASSIS_INDEX_KEY = 'bgp-chassis-index'
 
 LRP_CHASSIS_TO_MAIN_ROUTER = 1
 LRP_MAIN_ROUTER_TO_CHASSIS = 2
+LRP_CHASSIS_ROUTER_TO_CHASSIS_SWITCH = 3
+
+CHASSIS_PEER_CONNECTIONS = 'bgp-peer-connections'
+
+BGP_CHASSIS_NETWORK_NAME = 'bgp-chassis-network-name'
+BGP_CHASSIS_LRP_MAC = 'bgp-chassis-lrp-mac'

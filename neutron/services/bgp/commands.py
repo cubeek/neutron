@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import uuid
 
 from oslo_log import log
 from ovsdbapp.backend.ovs_idl import command as cmd
@@ -37,6 +38,14 @@ def get_lrp_name(from_name, to_name):
     return f'bgp-lrp-{from_name}-to-{to_name}'
 
 
+def get_lsp_name(from_name, to_name):
+    return f'bgp-lsp-{from_name}-to-{to_name}'
+
+
+def get_lsp_localnet_name(switch_name):
+    return f'bgp-lsp-{switch_name}-localnet'
+
+
 def get_hcg_name(hostname):
     return f'bgp-hcg-{hostname}'
 
@@ -56,6 +65,17 @@ def get_chassis_index(chassis):
         raise exceptions.ReconcileError(msg)
 
 
+class _LsAddCommand(nb_cmd.LsAddCommand):
+    def run_idl(self, txn):
+        try:
+            self.result = self.api.lookup('Logical_Switch', self.switch)
+        except idlutils.RowNotFound:
+            super().run_idl(txn)
+            self.result = self.api.lookup('Logical_Switch', self.switch)
+
+        self.set_columns(self.result, **self.columns)
+
+
 class _LrAddCommand(nb_cmd.LrAddCommand):
     def run_idl(self, txn):
         try:
@@ -63,6 +83,17 @@ class _LrAddCommand(nb_cmd.LrAddCommand):
         except idlutils.RowNotFound:
             super().run_idl(txn)
             self.result = self.api.lookup('Logical_Router', self.router)
+
+        self.set_columns(self.result, **self.columns)
+
+
+class _LspAddCommand(nb_cmd.LspAddCommand):
+    def run_idl(self, txn):
+        try:
+            self.result = self.api.lookup('Logical_Switch_Port', self.port)
+        except idlutils.RowNotFound:
+            super().run_idl(txn)
+            self.result = self.api.lookup('Logical_Switch_Port', self.port)
 
         self.set_columns(self.result, **self.columns)
 
@@ -96,6 +127,48 @@ class _HAChassisGroupAddCommand(nb_cmd.HAChassisGroupAddCommand):
         self.set_columns(hcg, **self.columns)
 
         self.result = hcg.uuid
+
+
+class CreateSwitchWithLocalnetCommand(_LsAddCommand):
+    def __init__(self, api, name, network_name):
+        super().__init__(api, name, may_exist=True)
+        self.network_name = network_name
+
+    def run_idl(self, txn):
+        super().run_idl(txn)
+
+        CreateLspLocalnetCommand(
+            self.api, self.switch, self.network_name,
+        ).run_idl(txn)
+
+
+class CreateLspLocalnetCommand(_LspAddCommand):
+    def __init__(self, api, switch_name, network_name):
+        self.localnet_lsp_name = get_lsp_localnet_name(switch_name)
+        super().__init__(
+            api, switch_name, self.localnet_lsp_name, may_exist=True)
+        self.network_name = network_name
+
+    def run_idl(self, txn):
+        super().run_idl(txn)
+
+        lsp = self.api.lookup('Logical_Switch_Port', self.localnet_lsp_name)
+
+        columns = {
+            'type': 'localnet',
+            'options': {'network_name': self.network_name},
+            'addresses': ['unknown'],
+        }
+
+        self.set_columns(lsp, **columns)
+
+
+class _LrRouteAddCommand(nb_cmd.LrRouteAddCommand):
+    def run_idl(self, txn):
+        super().run_idl(txn)
+        if isinstance(self.result, uuid.UUID):
+            self.result = self.api.lookup(
+                'Logical_Router_Static_Route', self.result)
 
 
 class ReconcileRouterCommand(_LrAddCommand):
@@ -196,6 +269,60 @@ class IndexAllChassis(cmd.BaseCommand):
             for c in self.api.tables['Chassis'].rows.values()]
 
 
+class ConnectRouterToSwitchCommand(cmd.BaseCommand):
+    def __init__(self, api, router_name, switch_name, lrp_mac, lrp_ip=None):
+        super().__init__(api)
+        self.router_name = router_name
+        self.switch_name = switch_name
+        self.lrp_mac = lrp_mac
+        self.lrp_ip = lrp_ip
+
+    def run_idl(self, txn):
+        lrp_name = get_lrp_name(self.router_name, self.switch_name)
+        if self.lrp_ip:
+            networks = [self.lrp_ip]
+        else:
+            networks = []
+        _LrpAddCommand(
+            self.api,
+            self.router_name,
+            lrp_name,
+            mac=self.lrp_mac,
+            networks=networks,
+        ).run_idl(txn)
+
+        lsp_name = get_lsp_name(self.switch_name, self.router_name)
+        _LspAddCommand(
+            self.api,
+            self.switch_name,
+            lsp_name,
+            addresses='router',
+            type='router',
+            options={'router-port': lrp_name},
+        ).run_idl(txn)
+
+
+class ConnectChassisRouterToSwitchCommand(ConnectRouterToSwitchCommand):
+    def __init__(
+            self, api, router_name, switch_name, lrp_mac, lrp_ip,
+            network_name):
+        super().__init__(api, router_name, switch_name, lrp_mac, lrp_ip)
+        self.network_name = network_name
+
+    def run_idl(self, txn):
+        super().run_idl(txn)
+        lrp_name = get_lrp_name(self.router_name, self.switch_name)
+        cmd.DbSetCommand(
+            self.api,
+            'Logical_Router_Port',
+            lrp_name,
+            external_ids={
+                constants.BGP_CHASSIS_NETWORK_NAME: self.network_name,
+                constants.BGP_CHASSIS_LRP_MAC: self.lrp_mac,
+            },
+        ).run_idl(txn)
+
+
 class ConnectRouterToMainRouterCommand(cmd.BaseCommand):
     def __init__(self, api, router_name, chassis, hcg):
         super().__init__(api)
@@ -254,6 +381,15 @@ class ConnectRouterToMainRouterCommand(cmd.BaseCommand):
 
 
 class ReconcileChassisCommand(cmd.BaseCommand):
+    """Reconcile all BGP components for a chassis
+
+    The command reconciles the chassis router and all its configured peer
+    connections based on the configured BGP bridges on the given chassis. It
+    creates a logical switch with a localnet port connected to the BGP bridge,
+    creates routes in and out on the router and connects the router to the main
+    router with a peer connection.
+    """
+
     def __init__(self, api, sb_api, chassis):
         super().__init__(api)
         self.sb_api = sb_api
@@ -285,6 +421,101 @@ class ReconcileChassisCommand(cmd.BaseCommand):
             router_name,
             self.chassis,
             hcg,
+        ).run_idl(txn)
+
+        router_name = get_chassis_router_name(self.hostname)
+        bgp_peer_mapping = helpers.get_chassis_bgp_peer_mapping(self.chassis)
+
+        for peer_index, (network_name, (lrp_ip, peer_ip)) in enumerate(
+                bgp_peer_mapping.items()):
+            ReconcileChassisPeerCommand(
+                self.api,
+                self.sb_api,
+                self.chassis,
+                network_name,
+                lrp_ip,
+                peer_ip,
+                peer_index,
+            ).run_idl(txn)
+
+
+class ReconcileChassisPeerCommand(cmd.BaseCommand):
+    """The command reconciles a BGP peer connection for a chassis
+
+    The BGP peer connection is based on the BGP bridge chassis configuration.
+    It creates a logical switch with a localnet port connected to the BGP
+    bridge. All traffic is routed out to the localnet port but there is a
+    policy based on the inport, so traffic coming from the main BGP router is
+    rerouted with ECMP to the peer IP, that typically resides on the
+    neighboring physical switch.
+    """
+    def __init__(
+            self, api, sb_api, chassis, network_name, lrp_ip, peer_ip,
+            peer_index):
+        super().__init__(api)
+        self.sb_api = sb_api
+        self.chassis = chassis
+        self.hostname = self.chassis.hostname.split('.')[0]
+        self.chassis_index = get_chassis_index(self.chassis)
+        self.network_name = network_name
+        self.lrp_ip = lrp_ip
+        self.peer_ip = peer_ip
+        self.peer_index = peer_index
+
+    @property
+    def mac_manager(self):
+        return helpers.LrpMacManager.get_instance()
+
+    @property
+    def router_name(self):
+        return get_chassis_router_name(self.hostname)
+
+    @property
+    def switch_name(self):
+        return f'bgp-ls-{self.hostname}-{self.network_name}'
+
+    def run_idl(self, txn):
+        CreateSwitchWithLocalnetCommand(
+            self.api,
+            self.switch_name,
+            self.network_name,
+        ).run_idl(txn)
+
+        lrp_mac = self.mac_manager.get_mac_address(
+            self.router_name,
+            constants.LRP_CHASSIS_ROUTER_TO_CHASSIS_SWITCH + self.peer_index)
+        ConnectChassisRouterToSwitchCommand(
+            self.api,
+            self.router_name,
+            self.switch_name,
+            lrp_mac=lrp_mac,
+            lrp_ip=self.lrp_ip,
+            network_name=self.network_name,
+        ).run_idl(txn)
+
+        _run_idl_command(_LrRouteAddCommand(
+            self.api,
+            self.router_name,
+            prefix='0.0.0.0/0',
+            nexthop=self.peer_ip,
+            ecmp=True,
+            # port parameter is OVN output_port column
+            port=get_lrp_name(self.router_name, self.switch_name),
+            may_exist=True,
+        ), txn)
+
+        main_router_lrp_ip = helpers.InternalIpManager.get_ip(
+            self.chassis_index, constants.LRP_MAIN_ROUTER_TO_CHASSIS)
+
+        match=f'inport==\"{get_lrp_name(self.router_name, self.switch_name)}\"'
+        nb_cmd.LrPolicyAddCommand(
+            self.api,
+            self.router_name,
+            priority=10,
+            match=match,
+            action='reroute',
+            nexthops=[main_router_lrp_ip],
+            may_exist=True,
         ).run_idl(txn)
 
 
