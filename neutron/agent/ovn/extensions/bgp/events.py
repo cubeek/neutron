@@ -73,3 +73,60 @@ class CreateLocalOVSEvent(LocalOVSEvent):
             ovn_bridge_mappings = []
         self.bgp_agent.configure_bgp_bridge_mappings(
             bgp_peer_bridges, ovn_bridge_mappings)
+
+
+class NewBgpBridgeEvent(BGPAgentEvent):
+    EVENTS = (BGPAgentEvent.ROW_CREATE, BGPAgentEvent.ROW_UPDATE,)
+    TABLE = 'Bridge'
+
+    @staticmethod
+    def _get_bgp_bridges(idl):
+        ovs_entries = list(idl.tables['Open_vSwitch'].rows.values())
+        if len(ovs_entries) > 1:
+            LOG.error(
+                "Expected 1 Open_vSwitch entry, got %s", len(ovs_entries))
+        try:
+            bgp_bridges_text = ovs_entries[0].external_ids.get(
+                constants.AGENT_BGP_PEER_BRIDGES, '')
+        except IndexError:
+            LOG.error("No Open_vSwitch entry found")
+            return []
+        if bgp_bridges_text:
+            return bgp_bridges_text.split(',')
+        return []
+
+    @staticmethod
+    def _is_bgp_bridge(row):
+        bgp_bridges = NewBgpBridgeEvent._get_bgp_bridges(row._idl)
+        return row.name in bgp_bridges
+
+    @staticmethod
+    def _has_nic_iface(row):
+        for port in row.ports:
+            iface = port.interfaces[0]
+            if iface.type in constants.BGP_BRIDGE_NIC_TYPES:
+                return True
+        return False
+
+    @staticmethod
+    def _nic_iface_added(row, old):
+        added_ports = set(row.ports) - set(old.ports)
+        return any(port.interfaces[0].type in constants.BGP_BRIDGE_NIC_TYPES
+                   for port in added_ports)
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+
+        if not self._is_bgp_bridge(row):
+            return False
+
+        if event == BGPAgentEvent.ROW_UPDATE:
+            if (not hasattr(old, 'ports') or
+                    not self._nic_iface_added(row, old)):
+                return False
+
+        return self._has_nic_iface(row)
+
+    def run(self, event, row, old):
+        self.bgp_agent.create_bgp_bridge(row.name)
