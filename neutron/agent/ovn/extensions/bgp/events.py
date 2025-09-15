@@ -78,3 +78,18 @@ class CreateLocalOVSEvent(LocalOVSEvent):
             ovn_bridge_mappings = []
         self.bgp_agent.configure_bgp_bridge_mappings(
             bgp_peer_bridges, ovn_bridge_mappings)
+
+
+class BGPChassisEvent(BGPAgentEvent):
+    """Base class for BGP chassis events."""
+    TABLE = 'Chassis'
+
+    def run(self, event, row, old):
+        self.bgp_agent.configure_chassis_bgp_bridges()
+        for br in self.bgp_agent.bgp_bridges.values():
+            LOG.debug("BGP bridge %s ips: %s", br.name, br.ips)
+
+
+class CreateChassisEvent(BGPChassisEvent):
+    """New chassis that already has LRP MAC map configured."""
+    EVENTS = (BGPChassisEvent.ROW_CREATE,)

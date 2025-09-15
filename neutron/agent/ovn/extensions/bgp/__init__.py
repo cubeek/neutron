@@ -13,16 +13,33 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import netaddr
 from oslo_log import log
 
+from neutron.agent.linux import ip_lib
 from neutron.agent.ovn.agent import ovsdb
+from neutron.agent.ovn.extensions.bgp import bridge
 from neutron.agent.ovn.extensions.bgp import events
 from neutron.agent.ovn.extensions import extension_manager as ovn_ext_mgr
+from neutron.services.bgp import constants
 
 LOG = log.getLogger(__name__)
 
+LOCALHOST_ADDRESSES = ('127.0.0.1', '::1')
+
 
 class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
+    def __init__(self):
+        super().__init__()
+        # A map of bridge names to the IPs on the bridge
+        # Example: {
+        #     'br-eth2': [
+        #         netaddr.IPNetwork('192.168.1.1/30'),
+        #         netaddr.IPNetwork('10.0.3.7/32')
+        #     ]
+        # }
+        self.bgp_bridges = {}
+
     @property
     def name(self):
         return "BGP agent extension"
@@ -43,11 +60,15 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
 
     @property
     def sb_idl_tables(self):
-        return []
+        return [
+            'Chassis',
+        ]
 
     @property
     def sb_idl_events(self):
-        return []
+        return [
+            events.CreateChassisEvent,
+        ]
 
     def configure_bgp_bridge_mappings(
             self, bgp_peer_bridges, ovn_bridge_mappings):
@@ -58,3 +79,35 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
         LOG.debug("Setting OVN bridge mappings: %s", ovn_bridge_mappings)
         ovsdb.set_ovn_bridge_mapping(
             self.agent_api.ovs_idl, ovn_bridge_mappings)
+
+    def post_connect_ovs_idl(self):
+        self.load_bgp_bridges()
+
+    def load_bgp_bridges(self):
+        """Create a list of BGP bridges objects"""
+        self.bgp_bridges = {
+            name: bridge.BGPChassisBridge(self, name)
+            for name in self.agent_api.ovs_idl.db_get(
+                'Open_vSwitch', '.', 'external_ids').execute(check_error=True)
+            .get(constants.AGENT_BGP_PEER_BRIDGES, '').split(',')
+            if name
+        }
+
+    @property
+    def host_ips(self):
+        host_ips = self.loopback_ips
+        for bgp_bridge in self.bgp_bridges.values():
+            host_ips.extend(bgp_bridge.ips)
+        return host_ips
+
+    @property
+    def loopback_ips(self):
+        cidrs = [netaddr.IPNetwork(dev['cidr'])
+                 for dev in ip_lib.get_devices_with_ip(
+                 namespace=None, name=ip_lib.LOOPBACK_DEVNAME)]
+        return [cidr for cidr in cidrs
+                if str(cidr.ip) not in LOCALHOST_ADDRESSES]
+
+    def configure_chassis_bgp_bridges(self):
+        for bgp_bridge in self.bgp_bridges.values():
+            bgp_bridge.configure_flows()

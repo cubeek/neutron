@@ -28,10 +28,15 @@ from neutron.services.bgp import ovn as bgp_ovn
 from neutron.tests.functional import base as n_base
 from neutron.tests.functional.services.bgp import fixtures
 
-idl_schema_map = {
-    'OVN_Northbound': bgp_ovn.OvnNbIdl,
-    'OVN_Southbound': bgp_ovn.OvnSbIdl,
-}
+
+class OvsTestIdl(connection.OvsdbIdl):
+    tables = ['Open_vSwitch', 'Bridge', 'Port', 'Interface']
+
+    def __init__(self, connection_string):
+        helper = idlutils.get_schema_helper(connection_string, 'Open_vSwitch')
+        for table in self.tables:
+            helper.register_table(table)
+        super().__init__(connection_string, helper)
 
 
 def requires_ovn_version_with_bgp():
@@ -48,6 +53,11 @@ def requires_ovn_version_with_bgp():
 
 class BaseBgpIDLTestCase(n_base.BaseLoggingTestCase):
     schemas = []
+    idl_schema_map = {
+        'OVN_Northbound': bgp_ovn.OvnNbIdl,
+        'OVN_Southbound': bgp_ovn.OvnSbIdl,
+        'Open_vSwitch': OvsTestIdl,
+    }
 
     def setUp(self):
         ovn_conf.register_opts()
@@ -57,7 +67,7 @@ class BaseBgpIDLTestCase(n_base.BaseLoggingTestCase):
         self.create_idls()
 
     def create_connection(self, schema):
-        idl = idl_schema_map[schema](self._schema_map[schema])
+        idl = self.idl_schema_map[schema](self._schema_map[schema])
         return connection.Connection(idl, timeout=10)
 
     def setup_venv(self):
