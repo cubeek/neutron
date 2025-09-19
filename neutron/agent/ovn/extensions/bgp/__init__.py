@@ -20,6 +20,7 @@ from neutron.agent.linux import ip_lib
 from neutron.agent.ovn.agent import ovsdb
 from neutron.agent.ovn.extensions.bgp import bridge
 from neutron.agent.ovn.extensions.bgp import events
+from neutron.agent.ovn.extensions.bgp import exceptions as exc
 from neutron.agent.ovn.extensions import extension_manager as ovn_ext_mgr
 from neutron.services.bgp import constants
 
@@ -48,6 +49,7 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
     def ovs_idl_events(self):
         return [
             events.CreateLocalOVSEvent,
+            events.UpdateLocalOVSEvent,
         ]
 
     @property
@@ -70,12 +72,7 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
             events.CreateChassisEvent,
         ]
 
-    def configure_bgp_bridge_mappings(
-            self, bgp_peer_bridges, ovn_bridge_mappings):
-        for bgp_bridge_name in bgp_peer_bridges:
-            bgp_bridge_mapping = f'{bgp_bridge_name}:{bgp_bridge_name}'
-            if bgp_bridge_mapping not in ovn_bridge_mappings:
-                ovn_bridge_mappings.append(bgp_bridge_mapping)
+    def configure_bgp_bridge_mappings(self, ovn_bridge_mappings):
         LOG.debug("Setting OVN bridge mappings: %s", ovn_bridge_mappings)
         ovsdb.set_ovn_bridge_mapping(
             self.agent_api.ovs_idl, ovn_bridge_mappings)
@@ -111,3 +108,27 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
     def configure_chassis_bgp_bridges(self):
         for bgp_bridge in self.bgp_bridges.values():
             bgp_bridge.configure_flows()
+
+    def update_chassis_external_ids(self, external_ids):
+        """Update the chassis external IDs"""
+        self.agent_api.sb_idl.db_set(
+            'Chassis', ovsdb.get_own_chassis_name(self.agent_api.ovs_idl),
+            external_ids=external_ids).execute(check_error=True)
+
+    def update_chassis_peer_connections(self):
+        """Update the chassis external IDs with the peer connections"""
+        peer_connections = []
+        for br in self.bgp_bridges.values():
+            try:
+                peer_connections.append(br.get_chassis_peer_connections_str())
+            except exc.NoBGPConnectionException as e:
+                LOG.error(
+                    "Failed to find BGP connection for the BGP bridge %s: %s",
+                    br.name, e)
+                continue
+        if not peer_connections:
+            LOG.error("No BGP connection found for the chassis")
+            return
+        self.update_chassis_external_ids({
+            constants.CHASSIS_PEER_CONNECTIONS: ','.join(peer_connections)
+        })

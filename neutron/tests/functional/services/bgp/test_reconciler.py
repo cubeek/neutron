@@ -1,0 +1,183 @@
+# Copyright 2025 Red Hat, Inc.
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+from oslo_config import cfg
+from ovsdbapp.backend.ovs_idl import connection
+from ovsdbapp.schema.ovn_southbound import impl_idl as sb_impl_idl
+
+from neutron.common import utils as common_utils
+from neutron.conf.plugins.ml2.drivers.ovn import ovn_conf
+from neutron.conf.services import bgp as bgp_config
+from neutron.services.bgp import commands
+from neutron.services.bgp import constants
+from neutron.services.bgp import ovn as bgp_ovn
+from neutron.services.bgp import reconciler
+from neutron.tests.functional import base
+
+
+class TestBGPReconciler(base.TestOVNFunctionalBase):
+    def setUp(self):
+        ovn_conf.register_opts()
+        bgp_config.register_opts(cfg.CONF)
+        sb_impl_idl.OvnSbApiIdlImpl._ovsdb_connection = None
+        bgp_ovn.BgpOvnSbIdl._ovsdb_connection = None
+        bgp_ovn.BgpOvnNbIdl._ovsdb_connection = None
+        super().setUp()
+        self.reconciler = reconciler.BGPTopologyReconciler()
+        self.nb_api = self.reconciler.nb_api
+        self.sb_api = self.reconciler.sb_api
+
+        self.test_sb_idl = self._create_additional_sb_idl()
+        self.chassis_bgp_networks = ('bgp-net-1', 'bgp-net-2')
+
+    @staticmethod
+    def _create_additional_sb_idl():
+        tables = ['Chassis', 'Chassis_Private', 'Encap']
+        connection_string = ovn_conf.get_ovn_sb_connection()
+        idl = connection.OvsdbIdl.from_server(
+            connection_string, 'OVN_Southbound', helper_tables=tables)
+        conn = connection.Connection(idl, timeout=10)
+        return sb_impl_idl.OvnSbApiIdlImpl(conn)
+
+    def _create_chassis(self, chassis_name, ip, bgp_peer_connections=None):
+        external_ids = {}
+        if bgp_peer_connections:
+            external_ids[
+                constants.CHASSIS_PEER_CONNECTIONS] = bgp_peer_connections
+        self.test_sb_idl.chassis_add(
+            chassis_name,
+            ['geneve'],
+            ip,
+            hostname=chassis_name,
+            external_ids=external_ids
+        ).execute(check_error=True)
+
+    def _get_all_chassis(self):
+        return self.sb_api.db_list_rows('Chassis').execute(check_error=True)
+
+    def validate_topology(self, chassis_names):
+        self._validate_main_router()
+        for chassis_name in chassis_names:
+            self._validate_chassis(chassis_name)
+        pass
+
+    def _validate_main_router(self):
+        main_router_name = bgp_config.get_main_router_name()
+        main_router = self.nb_api.lr_get(
+            main_router_name).execute(check_error=True)
+        all_chassis = {chassis.name for chassis in self._get_all_chassis()}
+        for lrp in main_router.ports:
+            try:
+                ha_chassis = lrp.ha_chassis_group[0].ha_chassis[0]
+                lrp_chassis = ha_chassis.chassis_name
+            except (IndexError, AttributeError):
+                self.fail(
+                    f"LRP {lrp.name} on the main BGP router has wrong chassis "
+                    f"binding: {lrp.ha_chassis_group}")
+            try:
+                all_chassis.remove(lrp_chassis)
+            except KeyError:
+                self.fail(f"Chassis {lrp_chassis} not found for LRP {lrp.name}"
+                          f" on the main BGP router")
+        if all_chassis:
+            self.fail(f"There are some chassis remaining that do not have an "
+                      f"LRP from the main BGP router bound to it: "
+                      f"{all_chassis}")
+
+    def _validate_chassis(self, chassis_name):
+        router_name = commands.get_chassis_router_name(chassis_name)
+        router = self.nb_api.lr_get(router_name).execute(check_error=True)
+
+        self.assertEqual(chassis_name, router.options.get('chassis'))
+        # each router has two connections out and one to the main BGP router
+        self.assertEqual(3, len(router.ports))
+
+        # each router should be connected to two switches with name format
+        # bgp-ls-<chassis_name>-<network_name> where network names are from
+        # the bgp_peer_connections: bgp-net-1 and bgp-net-2
+        for network_name in self.chassis_bgp_networks:
+            switch_name = f'bgp-ls-{chassis_name}-{network_name}'
+            ls = self.nb_api.ls_get(switch_name).execute(check_error=True)
+
+            # each switch should have a localnet port with the network name set
+            # and one port plugged to the router
+            self.assertEqual(2, len(ls.ports))
+            for lsp in ls.ports:
+                if lsp.type == 'localnet':
+                    self.assertEqual(
+                        network_name, lsp.options.get('network_name'))
+                elif lsp.type == 'router':
+                    lrp = self.nb_api.lrp_get(
+                        lsp.options.get('router-port')).execute(
+                            check_error=True)
+                    self.assertIn(lrp, router.ports)
+                    ext_ids = lrp.external_ids
+                    self.assertEqual(
+                        network_name, ext_ids[
+                            constants.BGP_CHASSIS_NETWORK_NAME])
+
+    def test_full_sync(self):
+        chassis_names = []
+        bgp_connections = ("%s;192.168.1.2/30;192.168.1.1,"
+                           "%s;192.168.2.2/30;192.168.2.1" % (
+                               self.chassis_bgp_networks))
+        for i in range(0, 6):
+            chassis_name = f'chassis{i+1}'
+            chassis_names.append(chassis_name)
+            self._create_chassis(
+                chassis_name, f'192.168.1.10{i+1}',
+                bgp_peer_connections=bgp_connections)
+        self.reconciler.full_sync()
+
+        self.validate_topology(chassis_names)
+
+    def test_setting_chassis_peer_connections_configures_lrps(self):
+        bgp_connections = ("%s;192.168.1.2/30;192.168.1.1,"
+                           "%s;192.168.2.2/30;192.168.2.1" % (
+                               self.chassis_bgp_networks))
+        self._create_chassis(
+            'chassis', '192.168.1.100')
+
+        self.reconciler.full_sync()
+
+        # we have an environment with one chassis without bgp peer connections
+        # set
+        chassis = self._get_all_chassis()[0]
+        self.assertEqual(
+            {constants.OVN_BGP_CHASSIS_INDEX_KEY: '0'}, chassis.external_ids)
+
+        # There should be no switches in the environment
+        switches = self.nb_api.db_list_rows('Logical_Switch').execute(
+            check_error=True)
+        self.assertEqual(0, len(switches))
+
+        external_ids = {constants.CHASSIS_PEER_CONNECTIONS: bgp_connections}
+
+        self.test_sb_idl.db_set(
+            'Chassis', 'chassis', external_ids=external_ids).execute(
+                check_error=True)
+
+        def switches_created():
+            return len(self.nb_api.db_list_rows('Logical_Switch').execute(
+                check_error=True)) == 2
+
+        common_utils.wait_until_true(
+            switches_created,
+            timeout=10,
+            exception=Exception(
+                "Peer switches were not created")
+        )
+
+        self.validate_topology(['chassis'])

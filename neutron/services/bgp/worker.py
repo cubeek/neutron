@@ -13,8 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutron.conf.plugins.ml2.drivers.ovn import ovn_conf
-from neutron.services.bgp import ovn
 from neutron.services.bgp import reconciler
 from neutron import worker
 
@@ -22,26 +20,20 @@ from neutron import worker
 class BGPWorker(worker.NeutronBaseWorker):
     def __init__(self):
         super().__init__(worker_process_count=0)
+        self._reconciler = None
 
     def start(self):
         super().start(desc="bgp worker")
-
-        self.nb_api = ovn.OvnNbIdl(ovn_conf.get_ovn_nb_connection()).start(
-            timeout=ovn_conf.get_ovn_ovsdb_timeout())
-        self.nb_api.set_lock()
-
-        self.sb_api = ovn.OvnSbIdl(ovn_conf.get_ovn_sb_connection()).start(
-            timeout=ovn_conf.get_ovn_ovsdb_timeout())
-        self._reconciler = reconciler.BGPTopologyReconciler(
-            self.nb_api,
-            self.sb_api)
+        self._reconciler = reconciler.BGPTopologyReconciler()
 
     def wait(self):
-        self._reconciler.full_sync()
+        if self._reconciler:
+            self._reconciler.full_sync()
 
     def stop(self):
-        pass
+        if self._reconciler:
+            self._reconciler.stop()
 
     def reset(self):
-        self.nb_api.restart_connection()
-        self.sb_api.restart_connection()
+        if self._reconciler:
+            self._reconciler.reset_connections()

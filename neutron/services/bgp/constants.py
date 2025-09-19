@@ -27,3 +27,5 @@ BGP_CHASSIS_LRP_MAC = 'bgp-chassis-lrp-mac'
 AGENT_BGP_PEER_BRIDGES = 'bgp-peer-bridges'
 
 AGENT_BGP_EXT_NAME = 'ovn-bgp'
+
+BGP_PORT_NUMBER = 179

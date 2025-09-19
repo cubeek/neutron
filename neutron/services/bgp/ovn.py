@@ -36,13 +36,15 @@ OVN_SB_TABLES = ('Chassis',)
 class OvnIdl(connection.OvsdbIdl):
     LOCK_NAME = 'bgp_topology_lock'
 
-    def __init__(self, connection_string):
+    def __init__(self, connection_string, events=None):
         if connection_string.startswith("ssl"):
             ovsdb_monitor._check_and_set_ssl_files(self.SCHEMA)
         helper = idlutils.get_schema_helper(connection_string, self.SCHEMA)
         for table in self.tables:
             helper.register_table(table)
         self.notify_handler = event.RowEventHandler()
+        if events:
+            self.notify_handler.watch_events(events)
         super().__init__(connection_string, helper, leader_only=True)
 
     def notify(self, event, row, updates=None):
@@ -54,6 +56,9 @@ class OvnIdl(connection.OvsdbIdl):
 
 
 class BgpOvnNbIdl(nb_impl_idl.OvnNbApiIdlImpl):
+    def stop(self):
+        self.ovsdb_connection.stop()
+
     def set_lock(self):
         LOG.debug("Setting lock for BGP topology")
         self.ovsdb_connection.idl.set_lock(self.ovsdb_connection.idl.LOCK_NAME)
@@ -68,6 +73,9 @@ class BgpOvnNbIdl(nb_impl_idl.OvnNbApiIdlImpl):
 
 
 class BgpOvnSbIdl(sb_impl_idl.OvnSbApiIdlImpl):
+    def stop(self):
+        self.ovsdb_connection.stop()
+
     def register_events(self, events):
         self.ovsdb_connection.idl.notify_handler.watch_events(events)
 

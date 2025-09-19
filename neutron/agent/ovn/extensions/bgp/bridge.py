@@ -13,17 +13,55 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import socket
 import tempfile
 
 import netaddr
 from oslo_log import log
+import psutil
 
 from neutron.agent.common import ovs_lib
 from neutron.agent.linux import ip_lib
 from neutron.agent.ovn.extensions.bgp import exceptions as exc
 from neutron.common import utils
+from neutron.services.bgp import constants
 
 LOG = log.getLogger(__name__)
+
+
+def get_bgp_protocol_port_number():
+    try:
+        # Get it from the operating system first
+        return socket.getservbyname('bgp', 'tcp')
+    except OSError:
+        # If not found, use the default port number
+        return constants.BGP_PORT_NUMBER
+
+
+def find_bgp_connections(source_ip_list):
+    """Find all remote peer IPs connected to a specific local source IP.
+
+    returns a list of tuples of strings (source_ip_cidr, peer_ip)
+    """
+    found_peers = set()
+
+    source_ip_dict = {str(ip.ip): ip for ip in source_ip_list}
+
+    bgp_port_number = get_bgp_protocol_port_number()
+
+    all_connections = psutil.net_connections(kind='tcp')
+    for conn in all_connections:
+        # Established connection with our monitored source IP and either source
+        # or destination port is BGP port
+        if (conn.laddr and conn.status == 'ESTABLISHED' and
+                conn.laddr.ip in source_ip_dict and
+                conn.raddr and bgp_port_number in [
+                    conn.raddr.port, conn.laddr.port]):
+            found_peers.add(
+                (str(source_ip_dict[conn.laddr.ip]), conn.raddr.ip))
+
+    LOG.debug("Found BGP connection peers: %s", found_peers)
+    return list(found_peers)
 
 
 class Bridge:
@@ -194,3 +232,27 @@ class BGPChassisBridge(Bridge):
         except Exception as e:
             LOG.error("Failed to configure BGP flows on bridge %s: %s",
                       self.name, e)
+
+    def get_bgp_connection_tuple(self):
+        """Get the peer IPs of the chassis in the SB table"""
+        found_peers = find_bgp_connections(self.ips)
+
+        peer_connections = None
+        if len(found_peers) > 1:
+            LOG.info("Found multiple connections from BGP bridge %s, "
+                     "preferring IPv4", self.name)
+            peer_connections = [conn for conn in found_peers
+                                if netaddr.IPAddress(conn[0]).version == 4]
+        elif len(found_peers) == 0:
+            LOG.warning("No connections found from BGP bridge %s", self.name)
+        else:
+            peer_connections = found_peers[0]
+
+        if peer_connections:
+            return peer_connections
+        raise exc.NoBGPConnectionException(
+            f"No BGP connection found for {self.name}")
+
+    def get_chassis_peer_connections_str(self):
+        peer_connections = self.get_bgp_connection_tuple()
+        return f'{self.name};{peer_connections[0]};{peer_connections[1]}'

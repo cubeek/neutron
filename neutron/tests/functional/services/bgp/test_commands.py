@@ -817,9 +817,6 @@ class ConnectChassisRouterToSwitchCommandTestCase(NbCommandsBase):
         self.assertEqual(
             network_name,
             lrp.external_ids[constants.BGP_CHASSIS_NETWORK_NAME])
-        self.assertEqual(
-            self.lrp_mac,
-            lrp.external_ids[constants.BGP_CHASSIS_LRP_MAC])
 
 
 class ReconcileChassisCommandTestCase(BgpCommandsBase):

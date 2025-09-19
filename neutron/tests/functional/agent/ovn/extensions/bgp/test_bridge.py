@@ -25,6 +25,7 @@ from neutron.agent.ovn.extensions.bgp import bridge
 from neutron.agent.ovn.extensions.bgp import exceptions as exc
 from neutron.common import utils
 from neutron.tests.common import net_helpers
+from neutron.tests.functional.agent.ovn.extensions import bgp as test_bgp_utils
 from neutron.tests.functional.services import bgp
 from neutron.tests.functional.services.bgp import fixtures
 
@@ -59,11 +60,6 @@ class BaseBridgeTestCase(bgp.BaseBgpSbIdlTestCase):
 
         return BGPAgentAPI(self.ovs_api, self.sb_api)
 
-    @staticmethod
-    def _dump_flows(bridge):
-        flows_str = bridge.ovs_bridge.dump_flows_for()
-        return flows_str.splitlines() if flows_str else []
-
 
 class BridgeTestCase(BaseBridgeTestCase):
     def test__apply_flows_as_bundle(self):
@@ -73,19 +69,19 @@ class BridgeTestCase(BaseBridgeTestCase):
             "priority=0 actions=drop"
         ]
 
-        pre_apply_flows = self._dump_flows(self.br)
+        pre_apply_flows = test_bgp_utils.dump_flows(self.br.ovs_bridge)
         # The default NORMAL flow
         self.assertEqual(1, len(pre_apply_flows))
 
         self.br._apply_flows_as_bundle(test_flows)
 
-        actual_flows = self._dump_flows(self.br)
+        actual_flows = test_bgp_utils.dump_flows(self.br.ovs_bridge)
         self.assertEqual(len(test_flows), len(actual_flows))
 
     def test__apply_flows_as_bundle_empty_deletes_flows(self):
         self.br._apply_flows_as_bundle([])
 
-        flows = self._dump_flows(self.br)
+        flows = test_bgp_utils.dump_flows(self.br.ovs_bridge)
         self.assertFalse(flows)
 
 
@@ -179,20 +175,23 @@ class BGPChassisBridgeConfigureFlowsTestCase(BaseBGPChassisBridgeTestCase):
         self.br.ovs_bridge.add_port(
             self.fake_nic_port_name, ('type', 'internal'))
 
-    def test_configure_flows_no_nic_installs_basic_flows(self):
-        self.br.ovs_bridge.delete_port(self.fake_nic_port_name)
-
-        flows_before = self._dump_flows(self.br)
-        self.assertGreater(len(flows_before), 0)
-
-        self.br.configure_flows()
-
+    def _wait_for_base_flows_are_installed(self):
         utils.wait_until_true(
-            lambda: len(self._dump_flows(self.br)) == 6,
+            lambda: len(test_bgp_utils.dump_flows(self.br.ovs_bridge)) > 5,
             timeout=5,
             exception=Exception(
                 "Expected didn't get expected number of flows in 5 seconds")
         )
+
+    def test_configure_flows_no_nic_installs_basic_flows(self):
+        self.br.ovs_bridge.delete_port(self.fake_nic_port_name)
+
+        flows_before = test_bgp_utils.dump_flows(self.br.ovs_bridge)
+        self.assertGreater(len(flows_before), 0)
+
+        self.br.configure_flows()
+
+        self._wait_for_base_flows_are_installed()
 
     @mock.patch.object(
             bridge.BGPChassisBridge, 'get_bridge_nic_ofport', return_value=1)
@@ -201,8 +200,9 @@ class BGPChassisBridgeConfigureFlowsTestCase(BaseBGPChassisBridgeTestCase):
         self._create_patch_ports()
 
         self.br.configure_flows()
+        self._wait_for_base_flows_are_installed()
 
-        flows = self._dump_flows(self.br)
+        flows = test_bgp_utils.dump_flows(self.br.ovs_bridge)
         flow_strings = ' '.join(flows)
 
         self.assertIn('arp', flow_strings)
@@ -219,8 +219,9 @@ class BGPChassisBridgeConfigureFlowsTestCase(BaseBGPChassisBridgeTestCase):
         self.br.lrp_mac = "aa:bb:cc:dd:ee:ff"
 
         self.br.configure_flows()
+        self._wait_for_base_flows_are_installed()
 
-        flows = self._dump_flows(self.br)
+        flows = test_bgp_utils.dump_flows(self.br.ovs_bridge)
         flow_strings = ' '.join(flows) if flows else ''
 
         self.assertIn('arp', flow_strings)
@@ -244,8 +245,9 @@ class BGPChassisBridgeConfigureFlowsTestCase(BaseBGPChassisBridgeTestCase):
         self.br.lrp_mac = "aa:bb:cc:dd:ee:ff"
 
         self.br.configure_flows()
+        self._wait_for_base_flows_are_installed()
 
-        flows = self._dump_flows(self.br)
+        flows = test_bgp_utils.dump_flows(self.br.ovs_bridge)
         flow_strings = ' '.join(flows)
 
         # 1. ARP and ICMPv6 flows

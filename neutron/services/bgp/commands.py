@@ -318,7 +318,6 @@ class ConnectChassisRouterToSwitchCommand(ConnectRouterToSwitchCommand):
             lrp_name,
             external_ids={
                 constants.BGP_CHASSIS_NETWORK_NAME: self.network_name,
-                constants.BGP_CHASSIS_LRP_MAC: self.lrp_mac,
             },
         ).run_idl(txn)
 

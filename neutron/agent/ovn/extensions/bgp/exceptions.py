@@ -23,3 +23,7 @@ class BridgePatchPortException(Exception):
 
 class LoopbackDeviceException(Exception):
     pass
+
+
+class NoBGPConnectionException(Exception):
+    pass
