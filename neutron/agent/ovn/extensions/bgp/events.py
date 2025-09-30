@@ -17,7 +17,10 @@ from oslo_log import log
 from ovsdbapp.backend.ovs_idl import event as row_event
 
 from neutron._i18n import _
+from neutron.agent.ovn.agent import ovsdb
+from neutron.common.ovn import constants as ovn_const
 from neutron.services.bgp import constants
+
 
 LOG = log.getLogger(__name__)
 
@@ -128,10 +131,37 @@ class BGPChassisEvent(BGPAgentEvent):
         return row.name == self.agent_api.chassis
 
     def run(self, event, row, old):
-        self.bgp_agent.configure_chassis_bgp_bridges()
+        self.bgp_agent.configure_all_chassis_bgp_bridges()
         self.bgp_agent.update_chassis_peer_connections()
 
 
 class CreateChassisEvent(BGPChassisEvent):
     """New chassis that already has LRP MAC map configured."""
     EVENTS = (BGPChassisEvent.ROW_CREATE,)
+
+
+class PortBindingLrpMacEvent(BGPAgentEvent):
+    """Port_Binding update event - set LRP MAC."""
+    TABLE = 'Port_Binding'
+    EVENTS = (BGPChassisEvent.ROW_CREATE, BGPChassisEvent.ROW_UPDATE)
+
+    def __init__(self, agent_api):
+        super().__init__(agent_api)
+        self.chassis = ovsdb.get_own_chassis_name(agent_api.ovs_idl)
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+        if row.type != ovn_const.PB_TYPE_L3GATEWAY:
+            return False
+        if row.chassis and row.chassis[0].name != self.chassis:
+            return False
+        if constants.BGP_CHASSIS_NETWORK_NAME not in row.external_ids:
+            return False
+        return True
+
+    def run(self, event, row, old):
+        lrp_mac = row.mac[0].split(' ', 1)[0]
+        self.bgp_agent.configure_chassis_bgp_bridge(
+            row.external_ids[constants.BGP_CHASSIS_NETWORK_NAME],
+            lrp_mac)

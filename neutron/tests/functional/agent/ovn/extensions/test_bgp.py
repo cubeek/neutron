@@ -21,6 +21,7 @@ import weakref
 
 from oslo_config import cfg
 from oslo_log import log as logging
+from ovsdbapp.backend.ovs_idl import event
 from ovsdbapp import venv
 
 from neutron.agent.common import ovs_lib
@@ -35,6 +36,16 @@ from neutron.tests.functional.agent.ovn.extensions import bgp as test_bgp_utils
 RE_OVSDB_CONNECTION_DIR = re.compile(
     r"unix:(?P<dir_path>[^/]*(?:/[^/]+)*)/[^/]+$")
 LOG = logging.getLogger(__name__)
+
+
+class WaitForPortBindingEvent(event.WaitEvent):
+    event_name = 'WaitForPortBindingEvent'
+
+    def __init__(self, port_name):
+        table = 'Port_Binding'
+        events = (self.ROW_CREATE,)
+        conditions = (('logical_port', '=', port_name),)
+        super().__init__(events, table, conditions, timeout=10)
 
 
 class TestBridge(ovs_lib.OVSBridge):
@@ -305,3 +316,52 @@ class BGPExtensionTestCase(test_ovn_neutron_agent.TestOVNNeutronAgentBase):
             lambda: len(test_bgp_utils.dump_flows(br)) == 1,
             timeout=10, sleep=0.1, exception=Exception(
                 'Flows not implemented for %s' % bridge_name))
+
+    def test_adding_chassis_with_lrp_mac_configures_flows(self):
+        port_name = 'ovn-port-bgp'
+        bridge_name = 'ovn-br-bgp'
+        lrp_mac = '02:00:00:00:00:00'
+        pb_wait_event = WaitForPortBindingEvent(port_name)
+        self.ovn_agent.sb_idl.idl.notify_handler.watch_event(pb_wait_event)
+
+        chassis = self.ovn_agent.sb_idl.db_find_rows(
+            'Chassis', ('name', '=', self.chassis_name)).execute(
+                check_error=True)[0]
+
+        lrp_ext_ids = {constants.BGP_CHASSIS_NETWORK_NAME: bridge_name}
+
+        bgp_bridge = self._add_bgp_bridge(bridge_name)
+
+        with self.nb_api.transaction(check_error=True) as txn:
+            txn.add(self.nb_api.lr_add('lr-bgp',
+                                  options={'chassis': self.chassis_name}))
+            txn.add(self.nb_api.lrp_add(
+                'lr-bgp',
+                port_name,
+                mac=lrp_mac,
+                networks=['192.168.1.2/30'],
+                external_ids=lrp_ext_ids))
+
+        self.assertTrue(pb_wait_event.wait())
+
+        try:
+            pb = self.ovn_agent.sb_idl.db_find_rows(
+                'Port_Binding', ('logical_port', '=', port_name)).execute(
+                    check_error=True)[0]
+        except IndexError:
+            self.fail('Port binding for port %s not found' % port_name)
+        self.ovn_agent.sb_idl.db_set(
+            'Port_Binding', pb.uuid,
+            chassis=chassis.uuid).execute(check_error=True)
+
+        def check_lrp_mac_flow():
+            flows = test_bgp_utils.dump_flows(bgp_bridge)
+            for flow in flows:
+                if "mod_dl_dst:%s" % lrp_mac in flow:
+                    return True
+            return False
+
+        utils.wait_until_true(
+            check_lrp_mac_flow,
+            timeout=10, sleep=0.1, exception=Exception(
+                'LRP MAC flow not found for %s' % lrp_mac))

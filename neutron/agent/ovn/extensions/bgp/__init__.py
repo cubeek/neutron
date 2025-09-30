@@ -64,12 +64,14 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
     def sb_idl_tables(self):
         return [
             'Chassis',
+            'Port_Binding',
         ]
 
     @property
     def sb_idl_events(self):
         return [
             events.CreateChassisEvent,
+            events.PortBindingLrpMacEvent,
         ]
 
     def configure_bgp_bridge_mappings(self, ovn_bridge_mappings):
@@ -105,7 +107,7 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
         return [cidr for cidr in cidrs
                 if str(cidr.ip) not in LOCALHOST_ADDRESSES]
 
-    def configure_chassis_bgp_bridges(self):
+    def configure_all_chassis_bgp_bridges(self):
         for bgp_bridge in self.bgp_bridges.values():
             bgp_bridge.configure_flows()
 
@@ -132,3 +134,12 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
         self.update_chassis_external_ids({
             constants.CHASSIS_PEER_CONNECTIONS: ','.join(peer_connections)
         })
+
+    def configure_chassis_bgp_bridge(self, network_name, lrp_mac):
+        try:
+            bridge = self.bgp_bridges[network_name]
+        except KeyError:
+            LOG.warning("No BGP bridge found for network %s", network_name)
+            return
+        bridge.lrp_mac = lrp_mac
+        bridge.configure_flows()
