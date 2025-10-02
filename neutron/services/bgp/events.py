@@ -13,12 +13,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import typing
+
 from oslo_log import log
 from ovsdbapp.backend.ovs_idl import event as row_event
 
+from neutron.common.ovn import constants as ovn_const
 from neutron.services.bgp import constants
 
 LOG = log.getLogger(__name__)
+
+_event_to_action = {
+    row_event.RowEvent.ROW_CREATE: 'reconcile',
+    row_event.RowEvent.ROW_UPDATE: 'reconcile',
+    row_event.RowEvent.ROW_DELETE: 'delete',
+}
 
 
 class BGPChassisEvent(row_event.RowEvent):
@@ -33,12 +42,21 @@ class BGPChassisEvent(row_event.RowEvent):
         return self.__class__.__name__
 
 
-class BGPChassisBridgesUpdateEvent(BGPChassisEvent):
+class BGPResourceEvent(BGPChassisEvent):
+    RESOURCE: typing.ClassVar[
+        constants.BGPReconcilerResource | None] = None
+
+    def run(self, event, row, old):
+        self.reconciler.reconcile(_event_to_action[event], self.RESOURCE, row)
+
+
+class BGPChassisBridgesUpdateEvent(BGPResourceEvent):
     """Event for chassis BGP bridges updates.
 
     This event is triggered only if bgp-bridges are changed.
     """
     EVENTS = (BGPChassisEvent.ROW_UPDATE,)
+    RESOURCE = constants.BGPReconcilerResource.CHASSIS_BGP_BRIDGES
 
     def match_fn(self, event, row, old):
         if not super().match_fn(event, row, old):
@@ -52,7 +70,42 @@ class BGPChassisBridgesUpdateEvent(BGPChassisEvent):
 
         return current_bgp_bridges != old_bgp_bridges
 
-    def run(self, event, row, old):
-        self.reconciler.reconcile(
-            self.reconciler.BGPReconcilerResource.CHASSIS_BGP_BRIDGES,
-            row)
+
+class ProviderSwitchCreatedEvent(BGPResourceEvent):
+    TABLE = 'Logical_Switch'
+    EVENTS = (BGPChassisEvent.ROW_CREATE,)
+    RESOURCE = constants.BGPReconcilerResource.PROVIDER_SWITCH
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+        net_type = row.external_ids.get(
+            ovn_const.OVN_NETTYPE_EXT_ID_KEY)
+        return net_type in constants.PROVIDER_NETWORK_TYPES
+
+
+class ProviderSwitchDeletedEvent(BGPResourceEvent):
+    TABLE = 'Logical_Switch'
+    EVENTS = (BGPChassisEvent.ROW_DELETE,)
+    RESOURCE = constants.BGPReconcilerResource.PROVIDER_SWITCH
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+        net_type = row.external_ids.get(
+            ovn_const.OVN_NETTYPE_EXT_ID_KEY)
+        return net_type in constants.PROVIDER_NETWORK_TYPES
+
+
+class GatewayIPRouteEvent(BGPResourceEvent):
+    TABLE = 'Logical_Router_Static_Route'
+    EVENTS = (BGPChassisEvent.ROW_CREATE,)
+    RESOURCE = constants.BGPReconcilerResource.GATEWAY_IP_ROUTE
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+        if ovn_const.OVN_SUBNET_EXT_ID_KEY not in row.external_ids:
+            return False
+        return row.external_ids.get(
+            ovn_const.OVN_ROUTER_IS_EXT_GW, '').lower() == 'true'

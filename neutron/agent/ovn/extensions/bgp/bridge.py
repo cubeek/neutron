@@ -138,6 +138,25 @@ class BGPChassisBridge(Bridge):
                 f"{len(nics_ofports)}")
         return nics_ofports[0]
 
+    def _check_requirements_met(self):
+        if not self.exists:
+            LOG.error("BGP bridge %s does not exist", self.name)
+            return
+
+        if not self.nic_ofport:
+            LOG.error("No NIC port found for %s", self.name)
+            return False
+
+        if not self.patch_port_ofport:
+            LOG.error("No patch port found for %s", self.name)
+            return False
+
+        if not self.lrp_mac:
+            LOG.error("No LRP MAC found for %s", self.name)
+            return False
+
+        return True
+
     def _get_flows_for_lrp(self):
         if not self.lrp_mac:
             LOG.error("No LRP MAC map found for %s", self.name)
@@ -194,9 +213,7 @@ class BGPChassisBridge(Bridge):
     def configure_flows(self):
         # The resulting openflows rules that will be written to a temporary
         # file and applied to the bridge.
-        if not self.exists:
-            LOG.warning("BGP bridge %s does not exist, skipping installing "
-                        "flows", self.name)
+        if not self._check_requirements_met():
             return
 
         LOG.debug("configuring BGP bridge flows for %s", self.name)

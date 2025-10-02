@@ -480,7 +480,7 @@ class ReconcileMainRouterCommandTestCase(bgp.BaseBgpNbIdlTestCase):
         self.assertEqual(router.name, self.router_name)
         self.assertEqual(router.options.get('dynamic-routing'), 'true')
         self.assertEqual(router.options.get('dynamic-routing-redistribute'),
-                         'connected-as-host,nat')
+                         constants.BGP_ROUTER_REDISTRIBUTE)
 
     def test_reconcile_main_router_with_dynamic_routing(self):
         commands.ReconcileMainRouterCommand(

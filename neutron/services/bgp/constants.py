@@ -13,6 +13,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import enum
+
+from neutron_lib import constants as n_lib_const
+
 BGP_ROUTER_REDISTRIBUTE = 'connected-as-host,nat'
 
 LRP_OPTIONS_DYNAMIC_ROUTING_MAINTAIN_VRF = 'dynamic-routing-maintain-vrf'
@@ -30,3 +34,21 @@ AGENT_BGP_PEER_BRIDGES = 'neutron-bgp-peer-bridges'
 AGENT_BGP_EXT_NAME = 'ovn-bgp'
 
 BGP_BRIDGE_NIC_TYPES = ('', 'system')
+
+BGP_PORT_NUMBER = 179
+
+BGP_LRP_TO_CHASSIS = 'neutron-bgp-lrp-to-chassis-router'
+BGP_LRP_TO_NEUTRON = 'neutron-bgp-lrp-to-neutron'
+
+PROVIDER_NETWORK_TYPES = [n_lib_const.TYPE_FLAT, n_lib_const.TYPE_VLAN]
+
+RELATED_RESOURCE_TAG = 'neutron-bgp-related-resource-uuid'
+
+
+class BGPReconcilerResource(enum.Enum):
+    CHASSIS_BGP_BRIDGES = 'bgp-bridges'
+    PROVIDER_SWITCH = 'provider-switch'
+    GATEWAY_IP_ROUTE = 'gateway-ip-route'
+
+    def __str__(self):
+        return self.value
