@@ -29,3 +29,6 @@ AGENT_BGP_PEER_BRIDGES = 'bgp-peer-bridges'
 AGENT_BGP_EXT_NAME = 'ovn-bgp'
 
 BGP_PORT_NUMBER = 179
+
+BGP_LRP_TO_CHASSIS = 'bgp-lrp-to-chassis-router'
+BGP_LRP_TO_NEUTRON = 'bgp-lrp-to-neutron'

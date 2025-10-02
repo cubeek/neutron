@@ -15,18 +15,28 @@
 
 import uuid
 
+import netaddr
+from neutron_lib import context
+from neutron_lib import constants as n_lib_const
+from neutron_lib.plugins import directory
 from oslo_log import log
 from ovsdbapp.backend.ovs_idl import command as cmd
 from ovsdbapp.backend.ovs_idl import idlutils
 from ovsdbapp.backend.ovs_idl import rowview
 from ovsdbapp.schema.ovn_northbound import commands as nb_cmd
 
+from neutron.common.ovn import constants as ovn_const
 from neutron.conf.services import bgp as bgp_config
 from neutron.services.bgp import constants
 from neutron.services.bgp import exceptions
 from neutron.services.bgp import helpers
 
 LOG = log.getLogger(__name__)
+
+DEAD_MAC = '00:de:ad:de:ad:00'
+FAKE_ROUTER_NAME = 'fake-router'
+FAKE_ROUTER_MAC_PREFIX = '00:00:01'
+PROVIDER_NETWORK_TYPES = [n_lib_const.TYPE_FLAT, n_lib_const.TYPE_VLAN]
 
 
 def _run_idl_command(cmd, txn):
@@ -54,6 +64,49 @@ def get_chassis_router_name(hostname):
     return f'bgp-lr-{hostname}'
 
 
+def get_provider_interconnect_switch_name(provider_switch_name):
+    return f'bgp-ls-interconnect-{provider_switch_name}'
+
+
+def get_neutron_network_id(switch_name):
+    return switch_name.split('neutron-', 1)[1]
+
+
+def get_network_prefixlen(net):
+    return netaddr.IPNetwork(net).prefixlen
+
+
+def _get_lrps_by_external_id(router, external_id):
+    return [lrp for lrp in router.ports
+            if hasattr(lrp, 'external_ids') and
+            external_id in lrp.external_ids]
+
+
+def lrps_to_chassis_routers(router):
+    return _get_lrps_by_external_id(router, constants.BGP_LRP_TO_CHASSIS)
+
+
+def lrps_to_neutron(router):
+    return _get_lrps_by_external_id(router, constants.BGP_LRP_TO_NEUTRON)
+
+
+def get_lrp_peer_ip(idl, lrp):
+    ip = idl.lookup('Logical_Router_Port', lrp.peer[0]).networks[0]
+    return ip.split('/')[0]
+
+
+def get_main_router(idl):
+    return idl.lookup('Logical_Router', bgp_config.get_main_router_name())
+
+
+def get_all_provider_switches(idl):
+    return [
+        rowview.RowView(s)
+        for s in idl.tables['Logical_Switch'].rows.values()
+        if s.external_ids.get(
+            ovn_const.OVN_NETTYPE_EXT_ID_KEY) in PROVIDER_NETWORK_TYPES]
+
+
 def get_chassis_index(chassis):
     try:
         return int(chassis.external_ids[constants.OVN_BGP_CHASSIS_INDEX_KEY])
@@ -63,6 +116,24 @@ def get_chassis_index(chassis):
         LOG.error(msg)
         # TODO(jlibosva): Use resource types for custom exceptions
         raise exceptions.ReconcileError(msg)
+
+
+def get_gw_ips(switch):
+    provider_subnets = directory.get_plugin().get_subnets(
+        context.get_admin_context(),
+        filters={
+            'network_id': get_neutron_network_id(switch.name)
+        },
+    )
+    if provider_subnets:
+        return [
+            f'{subnet['gateway_ip']}/'
+            f'{get_network_prefixlen(subnet['cidr'])}'
+            for subnet in provider_subnets]
+    else:
+        LOG.warning(f"No provider subnets found for switch "
+                    f"{switch.name}, skipping")
+        return []
 
 
 class _LsAddCommand(nb_cmd.LsAddCommand):
@@ -113,6 +184,8 @@ class _LrpAddCommand(nb_cmd.LrpAddCommand):
         self.result.mac = self.mac
         self.result.networks = self.networks
         self.result.peer = self.peer
+        if 'external_ids' not in self.columns:
+            self.columns['external_ids'] = {}
         self.set_columns(self.result, **self.columns)
 
 
@@ -130,9 +203,10 @@ class _HAChassisGroupAddCommand(nb_cmd.HAChassisGroupAddCommand):
 
 
 class CreateSwitchWithLocalnetCommand(_LsAddCommand):
-    def __init__(self, api, name, network_name):
+    def __init__(self, api, name, network_name, external_ids=None):
         super().__init__(api, name, may_exist=True)
         self.network_name = network_name
+        self.columns = {'external_ids': external_ids or {}}
 
     def run_idl(self, txn):
         super().run_idl(txn)
@@ -169,6 +243,156 @@ class _LrRouteAddCommand(nb_cmd.LrRouteAddCommand):
         if isinstance(self.result, uuid.UUID):
             self.result = self.api.lookup(
                 'Logical_Router_Static_Route', self.result)
+
+
+class ReconcileNeutronSwitchCommand(cmd.BaseCommand):
+    def __init__(self, api, n_switch, gw_ips):
+        super().__init__(api)
+        self.n_switch = n_switch
+        self.router_name = bgp_config.get_main_router_name()
+        self.gw_ips = gw_ips
+
+        self.network_name, vlan_tag = self.get_provider_data()
+        mm = helpers.LrpMacManager.get_instance()
+        self.lrp_mac = mm.get_mac_address(FAKE_ROUTER_NAME, vlan_tag)
+        self.interconnect_switch_name = get_provider_interconnect_switch_name(
+            self.n_switch.name)
+
+    def get_provider_data(self):
+        for port in self.n_switch.ports:
+            if port.type == ovn_const.LSP_TYPE_LOCALNET:
+                return port.options['network_name'], port.tag or 0
+        raise ValueError(
+            f"No localnet port found for switch {self.n_switch.name}")
+
+    def run_idl(self, txn):
+        ConnectRouterToSwitchCommand(
+            self.api,
+            self.router_name,
+            self.n_switch.name,
+            DEAD_MAC,
+        ).run_idl(txn)
+
+        interconnect_switch_ext_ids = {
+        }
+        CreateSwitchWithLocalnetCommand(
+            self.api,
+            self.interconnect_switch_name,
+            self.network_name,
+        ).run_idl(txn)
+
+        ConnectRouterToSwitchCommand(
+            self.api,
+            self.router_name,
+            self.interconnect_switch_name,
+            self.lrp_mac,
+            lrp_ips=self.gw_ips,
+        ).run_idl(txn)
+
+        lrp = get_lrp_name(self.router_name, self.interconnect_switch_name)
+        cmd.DbSetCommand(
+            self.api,
+            'Logical_Router_Port',
+            lrp,
+            external_ids={
+                constants.BGP_LRP_TO_NEUTRON: self.interconnect_switch_name,
+            },
+        ).run_idl(txn)
+
+        ReconcileMainRouterRoutesForProviderCommand(
+            self.api,
+            self.interconnect_switch_name,
+            self.gw_ips,
+        ).run_idl(txn)
+
+
+class ReconcileMainRouterRoutesForProviderCommand(cmd.BaseCommand):
+    def __init__(self, api, interconnect_switch_name, gw_ips):
+        super().__init__(api)
+        self.interconnect_switch_name = interconnect_switch_name
+        self.gw_ips = gw_ips
+        self.router = get_main_router(api)
+
+    def run_idl(self, txn):
+        lrp_interconnect_name = get_lrp_name(
+            self.router.name, self.interconnect_switch_name)
+        for lrp in lrps_to_chassis_routers(self.router):
+            ReconcileMainRouterRoutesAndPoliciesCommand(
+                self.api,
+                self.router,
+                lrp_interconnect_name,
+                lrp,
+                self.gw_ips,
+            ).run_idl(txn)
+
+
+class ReconcileMainRouterRoutesForChassisCommand(cmd.BaseCommand):
+    def __init__(self, api, chassis_router):
+        super().__init__(api)
+        self.router = get_main_router(api)
+        self.chassis_router = chassis_router
+        lrp_name = get_lrp_name(self.router.name, self.chassis_router.name)
+        self.lrp = self.api.lookup('Logical_Router_Port', lrp_name)
+
+    def run_idl(self, txn):
+        for switch in get_all_provider_switches(self.api):
+            gw_ips = get_gw_ips(switch)
+            interconnect_switch_name = get_provider_interconnect_switch_name(
+                switch.name)
+            interconnect_lrp_name = get_lrp_name(
+                self.router.name, interconnect_switch_name)
+            ReconcileMainRouterRoutesAndPoliciesCommand(
+                self.api,
+                self.router,
+                interconnect_lrp_name,
+                self.lrp,
+                gw_ips,
+            ).run_idl(txn)
+
+
+class ReconcileMainRouterRoutesAndPoliciesCommand(cmd.BaseCommand):
+    def __init__(self, api, router, interconnect_lrp_name, chassis_lrp, gw_ips):
+        super().__init__(api)
+        self.router = router
+        self.interconnect_lrp_name = interconnect_lrp_name
+        self.chassis_lrp = chassis_lrp
+        self.gw_ips = gw_ips
+
+    def run_idl(self, txn):
+        lrp_peer_ip = get_lrp_peer_ip(self.api, self.chassis_lrp)
+
+        # A fake route to get over the routing stage in routers logical flows
+        # This is required for the egress policy to work
+        nb_cmd.LrRouteAddCommand(
+            self.api,
+            self.router.name,
+            '0.0.0.0/0',
+            self.gw_ips[0].split('/')[0],
+            may_exist=True,
+        ).run_idl(txn)
+
+        # An egress policy to reroute traffic to the chassis router that is
+        # local to the chassis where the traffic originated from
+        nb_cmd.LrPolicyAddCommand(
+            self.api,
+            self.router.name,
+            priority=10,
+            match=f'inport==\"{self.interconnect_lrp_name}\" '
+                    f'&& is_chassis_resident(\"cr-{self.chassis_lrp.name}\")',
+            action='reroute',
+            nexthops=[lrp_peer_ip],
+            may_exist=True,
+        ).run_idl(txn)
+
+        # A ingress route from the chassis router to the interconnect switch
+        nb_cmd.LrRouteAddCommand(
+            self.api,
+            self.router.name,
+            self.gw_ips[0],
+            self.gw_ips[0].split('/')[0],
+            port=self.interconnect_lrp_name,
+            may_exist=True,
+        ).run_idl(txn)
 
 
 class ReconcileRouterCommand(_LrAddCommand):
@@ -208,7 +432,8 @@ class ReconcileMainRouterCommand(ReconcileRouterCommand):
     def options(self):
         return {
             'dynamic-routing': 'true',
-            'dynamic-routing-redistribute': 'connected-as-host,nat',
+#            'dynamic-routing-redistribute': 'connected-as-host,nat',
+            'dynamic-routing-redistribute': 'nat',
             'requested-tnl-key': bgp_config.get_bgp_router_tunnel_key(),
         }
 
@@ -270,17 +495,17 @@ class IndexAllChassis(cmd.BaseCommand):
 
 
 class ConnectRouterToSwitchCommand(cmd.BaseCommand):
-    def __init__(self, api, router_name, switch_name, lrp_mac, lrp_ip=None):
+    def __init__(self, api, router_name, switch_name, lrp_mac, lrp_ips=None):
         super().__init__(api)
         self.router_name = router_name
         self.switch_name = switch_name
         self.lrp_mac = lrp_mac
-        self.lrp_ip = lrp_ip
+        self.lrp_ips = lrp_ips
 
     def run_idl(self, txn):
         lrp_name = get_lrp_name(self.router_name, self.switch_name)
-        if self.lrp_ip:
-            networks = [self.lrp_ip]
+        if self.lrp_ips:
+            networks = self.lrp_ips
         else:
             networks = []
         _LrpAddCommand(
@@ -304,9 +529,9 @@ class ConnectRouterToSwitchCommand(cmd.BaseCommand):
 
 class ConnectChassisRouterToSwitchCommand(ConnectRouterToSwitchCommand):
     def __init__(
-            self, api, router_name, switch_name, lrp_mac, lrp_ip,
+            self, api, router_name, switch_name, lrp_mac, lrp_ips,
             network_name):
-        super().__init__(api, router_name, switch_name, lrp_mac, lrp_ip)
+        super().__init__(api, router_name, switch_name, lrp_mac, lrp_ips)
         self.network_name = network_name
 
     def run_idl(self, txn):
@@ -358,6 +583,7 @@ class ConnectRouterToMainRouterCommand(cmd.BaseCommand):
         lrp_main_ip = helpers.InternalIpManager.get_ip_cidr(
             self.chassis_index, constants.LRP_MAIN_ROUTER_TO_CHASSIS)
 
+        # A port on the chassis router
         _LrpAddCommand(
             self.api,
             self.router_name,
@@ -367,6 +593,7 @@ class ConnectRouterToMainRouterCommand(cmd.BaseCommand):
             peer=lrp_main
         ).run_idl(txn)
 
+        # A port on the main router
         _LrpAddCommand(
             self.api,
             main_router_name,
@@ -376,6 +603,9 @@ class ConnectRouterToMainRouterCommand(cmd.BaseCommand):
             peer=lrp_ch,
             ha_chassis_group=self.hcg,
             options={'dynamic-routing-maintain-vrf': 'true'},
+            external_ids={
+                constants.BGP_LRP_TO_CHASSIS: self.router_name,
+            },
         ).run_idl(txn)
 
 
@@ -408,11 +638,11 @@ class ReconcileChassisCommand(cmd.BaseCommand):
             self.chassis.name, 10).run_idl(txn)
 
         router_name = get_chassis_router_name(self.hostname)
-        ReconcileChassisRouterCommand(
+        chassis_router = _run_idl_command(ReconcileChassisRouterCommand(
             self.api,
             router_name,
             self.chassis,
-        ).run_idl(txn)
+        ), txn)
 
         # Connect chassis router to the main router
         ConnectRouterToMainRouterCommand(
@@ -420,6 +650,11 @@ class ReconcileChassisCommand(cmd.BaseCommand):
             router_name,
             self.chassis,
             hcg,
+        ).run_idl(txn)
+
+        ReconcileMainRouterRoutesForChassisCommand(
+            self.api,
+            chassis_router,
         ).run_idl(txn)
 
         router_name = get_chassis_router_name(self.hostname)
@@ -488,7 +723,7 @@ class ReconcileChassisPeerCommand(cmd.BaseCommand):
             self.router_name,
             self.switch_name,
             lrp_mac=lrp_mac,
-            lrp_ip=self.lrp_ip,
+            lrp_ips=[self.lrp_ip],
             network_name=self.network_name,
         ).run_idl(txn)
 
@@ -527,8 +762,19 @@ class FullSyncBGPTopologyCommand(cmd.BaseCommand):
     def run_idl(self, txn):
         LOG.debug("BGP full sync topology started")
         self.reconcile_central(txn)
+        self.reconcile_neutron_switches(txn)
         self.reconcile_all_chassis(txn)
         LOG.debug("BGP full sync topology completed")
+
+
+    def reconcile_neutron_switches(self, txn):
+        for switch in get_all_provider_switches(self.api):
+            gw_ips = get_gw_ips(switch)
+            ReconcileNeutronSwitchCommand(
+                self.api,
+                switch,
+                gw_ips,
+            ).run_idl(txn)
 
     def reconcile_all_chassis(self, txn):
         for chassis in self.chassis:

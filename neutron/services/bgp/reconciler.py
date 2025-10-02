@@ -35,6 +35,8 @@ class BGPTopologyReconciler:
             return self.value
 
     def __init__(self):
+        self._register_fake_router_for_lrp_manager()
+
         self.nb_api = ovn.OvnNbIdl(
             ovn_conf.get_ovn_nb_connection(),
             self.nb_events).start(
@@ -45,6 +47,17 @@ class BGPTopologyReconciler:
             ovn_conf.get_ovn_sb_connection(),
             self.sb_events).start(
                 timeout=ovn_conf.get_ovn_ovsdb_timeout())
+
+    def _register_fake_router_for_lrp_manager(self):
+        """Register a fake router for the LRP manager
+
+        This router serves only as a MAC prefix generator for connection
+        between the BGP and the Neutron world.
+        """
+        mm = helpers.LrpMacManager.get_instance()
+        mm.register_router(
+            commands.FAKE_ROUTER_NAME,
+            commands.FAKE_ROUTER_MAC_PREFIX)
 
     def stop(self):
         self.nb_api.stop()
