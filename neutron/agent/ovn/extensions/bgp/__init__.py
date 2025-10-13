@@ -50,6 +50,7 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
         return [
             events.CreateLocalOVSEvent,
             events.UpdateLocalOVSEvent,
+            events.NewBgpBridgeEvent,
         ]
 
     @property

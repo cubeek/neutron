@@ -121,6 +121,35 @@ class UpdateLocalOVSEvent(LocalOVSEvent):
         return desired_mappings != bm_bridges
 
 
+class NewBgpBridgeEvent(BGPAgentEvent):
+    EVENTS = (BGPAgentEvent.ROW_CREATE,)
+    TABLE = 'Bridge'
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+        bgp_bridges = self._get_bgp_bridges(row._idl)
+        return row.name in self.bgp_agent.bgp_bridges
+
+    @staticmethod
+    def _get_bgp_bridges(idl):
+        ovs_entries = list(idl.tables['Open_vSwitch'].rows.values())
+        if len(ovs_entries) != 1:
+            LOG.error(
+                "Expected 1 Open_vSwitch entry, got %s", len(ovs_entries))
+            return []
+        bgp_bridges_text = ovs_entries[0].external_ids.get(
+            'bgp-peer-bridges', '')
+        if bgp_bridges_text:
+            return bgp_bridges_text.split(',')
+        return []
+
+    def run(self, event, row, old):
+        bgp_bridge = self.bgp_agent.bgp_bridges[row.name]
+        bgp_bridge.configure_flows()
+        self.bgp_agent.update_chassis_peer_connections()
+
+
 class BGPChassisEvent(BGPAgentEvent):
     """Base class for BGP chassis events."""
     TABLE = 'Chassis'
