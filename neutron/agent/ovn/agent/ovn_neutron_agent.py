@@ -166,7 +166,7 @@ class OVNNeutronAgent(service.Service):
         for extension in self.ext_manager:
             events += extension.obj.ovs_idl_events
         events = [e(self) for e in set(events)]
-        return ovsdb.MonitorAgentOvsIdl(set(events)).start()
+        return ovsdb.MonitorAgentOvsIdl(self, set(events)).start()
 
     def _load_nb_idl(self):
         events = []
@@ -182,7 +182,7 @@ class OVNNeutronAgent(service.Service):
 
         events = [e(self) for e in set(events)]
         tables = set(tables)
-        return ovsdb.MonitorAgentOvnNbIdl(tables, events).start()
+        return ovsdb.MonitorAgentOvnNbIdl(self, tables, events).start()
 
     def _load_sb_idl(self):
         events = [SbGlobalUpdateEvent,
@@ -195,7 +195,7 @@ class OVNNeutronAgent(service.Service):
 
         events = [e(self) for e in set(events)]
         tables = set(tables)
-        return ovsdb.MonitorAgentOvnSbIdl(tables, events,
+        return ovsdb.MonitorAgentOvnSbIdl(self, tables, events,
                                           chassis=self.chassis).start()
 
     def register_ovn_agent(self):

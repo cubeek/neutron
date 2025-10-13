@@ -34,7 +34,8 @@ class MonitorAgentOvnSbIdl(ovsdb_monitor.OvnIdl):
 
     SCHEMA = 'OVN_Southbound'
 
-    def __init__(self, tables, events, chassis=None):
+    def __init__(self, agent, tables, events, chassis=None):
+        self.agent = agent
         connection_string = config.get_ovn_sb_connection()
         ovsdb_monitor._check_and_set_ssl_files(self.SCHEMA)
         helper = self._get_ovsdb_helper(connection_string)
@@ -60,14 +61,16 @@ class MonitorAgentOvnSbIdl(ovsdb_monitor.OvnIdl):
         return impl_idl_ovn.OvsdbSbOvnIdl(conn)
 
     def post_connect(self):
-        pass
+        for extension in self.agent.ext_manager:
+            extension.obj.post_connect_sb_idl()
 
 
 class MonitorAgentOvnNbIdl(ovsdb_monitor.OvnIdl):
 
     SCHEMA = 'OVN_Northbound'
 
-    def __init__(self, tables, events):
+    def __init__(self, agent, tables, events):
+        self.agent = agent
         connection_string = config.get_ovn_nb_connection()
         ovsdb_monitor._check_and_set_ssl_files(self.SCHEMA)
         helper = self._get_ovsdb_helper(connection_string)
@@ -89,15 +92,17 @@ class MonitorAgentOvnNbIdl(ovsdb_monitor.OvnIdl):
         return impl_idl_ovn.OvsdbNbOvnIdl(conn)
 
     def post_connect(self):
-        pass
+        for extension in self.agent.ext_manager:
+            extension.obj.post_connect_nb_idl()
 
 
 class MonitorAgentOvsIdl(ovsdb_conn.OvsIdl):
 
-    def __init__(self, events):
+    def __init__(self, agent, events):
         super().__init__()
         if events:
             self.notify_handler.watch_events(events)
+        self.agent = agent
 
     @ovn_utils.retry()
     def start(self):
@@ -107,7 +112,8 @@ class MonitorAgentOvsIdl(ovsdb_conn.OvsIdl):
         return impl_idl_ovs.OvsdbIdl(conn)
 
     def post_connect(self):
-        pass
+        for extension in self.agent.ext_manager:
+            extension.obj.post_connect_ovs_idl()
 
 
 def get_ovn_bridge(ovs_idl):

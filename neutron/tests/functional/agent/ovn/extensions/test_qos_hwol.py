@@ -100,7 +100,7 @@ class QoSBandwidthLimitEventTestCase(base.TestOVNFunctionalBase):
 
         mock_agent = mock.MagicMock(nb_idl=self.nb_api)
         events = [qos_hwol.QoSBandwidthLimitEvent(mock_agent)]
-        agent_ovsdb.MonitorAgentOvnNbIdl(qos_hwol.NB_IDL_TABLES,
+        agent_ovsdb.MonitorAgentOvnNbIdl(mock_agent, qos_hwol.NB_IDL_TABLES,
                                          events).start()
         lswitch_name = utils.ovn_name(self.net['id'])
         port_id = self.port['id']
@@ -142,7 +142,7 @@ class QoSLogicalSwitchPortEventTestCase(base.TestOVNFunctionalBase):
 
         mock_agent = mock.MagicMock(nb_idl=self.nb_api)
         events = [qos_hwol.QoSLogicalSwitchPortEvent(mock_agent)]
-        agent_ovsdb.MonitorAgentOvnNbIdl(qos_hwol.NB_IDL_TABLES,
+        agent_ovsdb.MonitorAgentOvnNbIdl(mock_agent, qos_hwol.NB_IDL_TABLES,
                                          events).start()
         port_id = self.port['id']
         max_kbps, min_kbps = 9000, 5000
@@ -185,8 +185,9 @@ class PortBindingChassisCreatedEventTestCase(base.TestOVNFunctionalBase):
         events = [qos_hwol.PortBindingChassisCreatedEvent(mock_agent)]
         chassis_name = self.add_fake_chassis('ovn-host-fake')
         mock_agent.chassis = chassis_name
-        agent_ovsdb.MonitorAgentOvnSbIdl(qos_hwol.SB_IDL_TABLES, events,
-                                         chassis=chassis_name).start()
+        agent_ovsdb.MonitorAgentOvnSbIdl(
+            mock_agent, qos_hwol.SB_IDL_TABLES, events, chassis=chassis_name
+        ).start()
         lsp_columns = {}
         lsp_name = self.port['id']
         ls_name = utils.ovn_name(self.net['id'])

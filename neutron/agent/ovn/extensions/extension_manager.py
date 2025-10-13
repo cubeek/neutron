@@ -151,6 +151,30 @@ class OVNAgentExtension(extension.AgentExtension, metaclass=abc.ABCMeta):
     def sb_idl_events(self):
         pass
 
+    def post_connect_ovs_idl(self):
+        """Routine that is called after the agent has connected to the OVSDB.
+
+        This routine is called after the agent has already a connection to the
+        ovsdb-server but before the ovsdb events are being processed.
+        """
+        pass
+
+    def post_connect_nb_idl(self):
+        """Routine that is called after the agent has connected to the NB DB.
+
+        This routine is called after the agent has already a connection to the
+        ovsdb-server but before the ovsdb events are being processed.
+        """
+        pass
+
+    def post_connect_sb_idl(self):
+        """Routine that is called after the agent has connected to the SB DB.
+
+        This routine is called after the agent has already a connection to the
+        ovsdb-server but before the ovsdb events are being processed.
+        """
+        pass
+
 
 class OVNAgentExtensionAPI:
     """Implements the OVN Neutron Agent API"""
