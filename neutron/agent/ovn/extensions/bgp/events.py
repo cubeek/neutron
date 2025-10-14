@@ -150,6 +150,50 @@ class NewBgpBridgeEvent(BGPAgentEvent):
         self.bgp_agent.update_chassis_peer_connections()
 
 
+class BgpBridgePortEvent(BGPAgentEvent):
+    EVENTS = (BGPAgentEvent.ROW_CREATE,)
+    TABLE = 'Interface'
+    TYPES = ('', 'patch')
+
+    def get_bgp_bridge(self, port_name):
+        # We just need access to BaseOVS
+        some_bridge = next(iter(self.bgp_agent.bgp_bridges.values()))
+        port_bridge = some_bridge.ovs_bridge.get_bridge_for_iface(port_name)
+        return port_bridge
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+
+        try:
+            port_bridge = self.get_bgp_bridge(row.name)
+            LOG.debug("XXX matching BgpBridgePortEvent: %s", port_bridge)
+        except StopIteration:
+            # No BGP bridges configured
+            return False
+
+        # The port is not on a BGP bridge
+        if port_bridge not in self.bgp_agent.bgp_bridges:
+            return False
+
+        # We are interested in the NIC or patch port to the integration bridge
+        if row.type not in self.TYPES:
+            return False
+
+        return True
+
+    def run(self, event, row, old):
+        LOG.debug("XXX BgpBridgePortEvent: %s", row.name)
+        bgp_bridge = self.bgp_agent.bgp_bridges[self.get_bgp_bridge(row.name)]
+        ofport = row.ofport[0]
+        if row.type == 'patch':
+            bgp_bridge.configure_flows_for_patch_port(ofport)
+        else:
+            bgp_bridge.configure_flows_for_nic_port(ofport)
+
+        self.bgp_agent.update_chassis_peer_connections()
+
+
 class BGPChassisEvent(BGPAgentEvent):
     """Base class for BGP chassis events."""
     TABLE = 'Chassis'

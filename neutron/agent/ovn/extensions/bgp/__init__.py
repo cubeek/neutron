@@ -51,6 +51,7 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
             events.CreateLocalOVSEvent,
             events.UpdateLocalOVSEvent,
             events.NewBgpBridgeEvent,
+            events.BgpBridgePortEvent,
         ]
 
     @property

@@ -233,6 +233,26 @@ class BGPChassisBridge(Bridge):
             LOG.error("Failed to configure BGP flows on bridge %s: %s",
                       self.name, e)
 
+    @utils.throttler()
+    def configure_flows_for_patch_port(self, patch_port_ofport):
+        LOG.debug("XXX configuring BGP flows for patch port %s", patch_port_ofport)
+        flows = self._get_flows_for_patch_port(patch_port_ofport)
+        try:
+            self._apply_flows_as_bundle(flows)
+        except Exception as e:
+            LOG.error("Failed to configure BGP flows on bridge %s: %s",
+                      self.name, e)
+
+    @utils.throttler()
+    def configure_flows_for_nic_port(self, nic_ofport):
+        LOG.debug("XXX configuring BGP flows for NIC port %s", nic_ofport)
+        flows = self._get_flows_for_nic_port(nic_ofport)
+        try:
+            self._apply_flows_as_bundle(flows)
+        except Exception as e:
+            LOG.error("Failed to configure BGP flows on bridge %s: %s",
+                      self.name, e)
+
     def get_bgp_connection_tuple(self):
         """Get the peer IPs of the chassis in the SB table"""
         found_peers = find_bgp_connections(self.ips)
