@@ -15,6 +15,8 @@
 
 import socket
 import tempfile
+import threading
+import time
 
 import netaddr
 from oslo_log import log
@@ -23,6 +25,7 @@ import psutil
 from neutron.agent.common import ovs_lib
 from neutron.agent.linux import ip_lib
 from neutron.agent.ovn.extensions.bgp import exceptions as exc
+from neutron.common.ovn import constants as ovn_const
 from neutron.common import utils
 from neutron.services.bgp import constants
 
@@ -90,7 +93,8 @@ class Bridge:
             LOG.debug("Applying %d BGP flows as bundle to bridge %s",
                       len(flows), self.name)
 
-            self.ovs_bridge.run_ofctl("add-flows", ["--bundle", f.name])
+            self.ovs_bridge.run_ofctl(
+                "add-flows", ["--bundle", f.name])
 
 
 class BGPChassisBridge(Bridge):
@@ -102,23 +106,118 @@ class BGPChassisBridge(Bridge):
 
     def __init__(self, bgp_agent_api, name):
         super().__init__(bgp_agent_api, name)
-        self.lrp_mac = None
+        self.lrp_mac = self._get_lrp_mac()
+        self.patch_port_ofport = self._get_bridge_patch_port_ofport()
+        # the NIC exists but may not have an ofport yet
+        self._nic_ofport = self._get_bridge_nic_ofport()
+        self.stop_bgp_discovery_event = threading.Event()
 
     def __str__(self):
         return f"BGPChassisBridge(name={self.name}, ips={self.ips})"
 
     __repr__ = __str__
 
-    def get_bridge_patch_port_ofport(self):
-        """Return the ofport of the patch port of the given bridge"""
-        patch_ports_ofports = [
+    @property
+    def nic_ofport(self):
+        # The NIC existed when the bridge was created but did not have an
+        # ofport assigned yet
+        if self._nic_ofport == []:
+            for i in range(11):
+                self._nic_ofport = self._get_bridge_nic_ofport()
+                if self._nic_ofport == []:
+                    time.sleep(0.1)
+                    continue
+                break
+            else:
+                LOG.error("ofport for NIC for bridge %s has not been set",
+                          self.name)
+        return self._nic_ofport
+
+    def _get_lrp_mac(self):
+        ext_ids = {constants.BGP_CHASSIS_NETWORK_NAME: self.name}
+        port_bindings = self.sb_idl.db_find_rows(
+            'Port_Binding',
+            ('type', '=', ovn_const.PB_TYPE_L3GATEWAY),
+            ('external_ids', '=', ext_ids)).execute(
+                check_error=True)
+        for pb in port_bindings:
+            if (pb.chassis and
+                    pb.chassis[0].name == self.bgp_agent_api.chassis_name):
+                return pb.mac[0].split(' ', 1)[0]
+
+        return None
+
+    def _get_bridge_ofports_per_type(self, type):
+        return [
             iface['ofport'] for iface in self.bridge_ifaces()
-            if iface['type'] == 'patch']
+            if iface['type'] == type]
+
+    def _get_bridge_patch_port_ofport(self):
+        patch_ports_ofports = self._get_bridge_ofports_per_type('patch')
         if len(patch_ports_ofports) != 1:
-            raise exc.BridgePatchPortException(
-                f"Expected 1 patch port for bridge {self.name}, "
-                f"got {len(patch_ports_ofports)}")
+            return None
         return patch_ports_ofports[0]
+
+    def _get_bridge_nic_ofport(self):
+        # REVISIT(jlibosva): we can consider supporting OVS bonds too
+        nics_ofports = self._get_bridge_ofports_per_type('')
+        if len(nics_ofports) != 1:
+            raise exc.BridgeNicException(
+                f"Expected 1 NIC for bridge {self.name}, got "
+                f"{len(nics_ofports)}")
+        LOG.debug("XXX NIC %s", nics_ofports)
+        return nics_ofports[0]
+
+    def discover_bgp_peer_in_thread(self):
+        """Spawn a thread to discover the BGP peer IP"""
+        bgp_discovery_thread = threading.Thread(
+            target=self._discover_bgp_peer,
+            name=f"BGP-Peer-Discovery-{self.name}"
+        )
+        bgp_discovery_thread.daemon = True
+        LOG.debug("XXX Starting BGP peer discovery thread for bridge %s",
+                  self.name)
+        bgp_discovery_thread.start()
+
+    def _discover_bgp_peer(self):
+        """Poll until BGP peer connection is found, then signal and exit"""
+        LOG.debug("XXX BGP peer discovery polling started for bridge %s",
+                  self.name)
+
+        while not self.stop_bgp_discovery_event.is_set():
+            if not self.exists:
+                LOG.debug("Bridge %s no longer exists, stopping peer "
+                          "discovery", self.name)
+                return
+
+            try:
+                # This will raise NoBGPConnectionException if not found
+                peer_connection = self.get_chassis_peer_connections_str()
+            except exc.NoBGPConnectionException:
+                pass
+            else:
+                LOG.info("XXX Discovered BGP peer for bridge %s: %s",
+                        self.name, peer_connection)
+
+                # Update chassis external IDs with peer connection
+                # This must happen BEFORE signaling, as it triggers the creation
+                # of logical switches and patch ports by OVN controller
+                try:
+                    self.bgp_agent_api.add_chassis_peer_connections(
+                        peer_connection)
+                    LOG.debug("XXX Updated chassis peer connections for "
+                              "bridge %s", self.name)
+                except Exception as e:
+                    LOG.error("Failed to update chassis peer connections for "
+                             "bridge %s: %s", self.name, e)
+                    # Continue anyway - the set_bgp_session_event() will allow
+                    # configuration to proceed
+
+                return
+
+            self.stop_bgp_discovery_event.wait(1.0)
+
+        LOG.debug("XXX BGP peer discovery stopped for bridge %s", self.name)
 
     @property
     def exists(self):
@@ -131,63 +230,62 @@ class BGPChassisBridge(Bridge):
         return self.ovs_idl.db_list(
             'Interface', ifaces, if_exists=True).execute(check_error=True)
 
-    def get_bridge_nic_ofport(self):
-        """Return the ofport of the NIC of the given bridge"""
-        nics_ofports = []
-        for iface in self.bridge_ifaces():
-            # REVISIT(jlibosva): we can consider supporting OVS bonds too
-            if iface['type'] not in ('patch', 'internal'):
-                nics_ofports.append(iface['ofport'])
-        if len(nics_ofports) != 1:
-            raise exc.BridgeNicException(
-                f"Expected 1 NIC for bridge {self.name}, "
-                f"got {len(nics_ofports)}")
-        return nics_ofports[0]
-
     @property
     def ips(self):
         return [netaddr.IPNetwork(ip['cidr'])
                 for ip in ip_lib.get_devices_with_ip(
                     namespace=None, name=self.name)]
 
-    def _get_lrp_flow(self, nic_ofport, patch_port_ofport):
+    def _get_lrp_flow(self):
         if not self.lrp_mac:
-            LOG.debug("No LRP MAC map found for %s", self.name)
+            LOG.error("No LRP MAC map found for %s", self.name)
+            return []
+
+        if not self.nic_ofport:
+            LOG.error("No NIC port found for %s", self.name)
             return []
 
         LOG.debug(f"Adding a flow to direct data plane traffic to OVN "
-                    f"from {nic_ofport} to {patch_port_ofport} using MAC"
-                    f" {self.lrp_mac}")
+                  f"from {self.nic_ofport} to {self.patch_port_ofport} using "
+                  f"MAC {self.lrp_mac}")
         return [
-            f"priority=80,in_port={nic_ofport},"
-            f"actions=mod_dl_dst:{self.lrp_mac},output:{patch_port_ofport}"
+            f"priority=80,in_port={self.nic_ofport},"
+            f"actions=mod_dl_dst:{self.lrp_mac},output:{self.patch_port_ofport}"
         ]
 
-    def _get_flows_for_patch_port(self, patch_port_ofport):
+    def _get_flows_for_patch_port(self):
+        if not self.patch_port_ofport:
+            LOG.error("Attempting to configure flows for patch port, but no "
+                      "patch port found for %s", self.name)
+            return []
         return [
-            f"priority=100,in_port={patch_port_ofport},"
+            f"priority=100,in_port={self.patch_port_ofport},"
             f"actions=NORMAL"
         ]
 
-    def _get_flows_for_nic_port(self, nic_ofport):
+    def _get_flows_for_nic_port(self):
+        if not self.nic_ofport:
+            LOG.error("Attempting to configure flows for NIC port, but no "
+                      "NIC port found for %s", self.name)
+            return []
             # Allow IPv6 link-local traffic
-        flows = [f"priority=100,ipv6,in_port={nic_ofport},ipv6_dst=fe80::/64 "
+        flows = [f"priority=100,ipv6,in_port={self.nic_ofport},ipv6_dst=fe80::/64 "
                  f"actions=NORMAL"]
 
         # Direct traffic meant for the host IPs
         for host_ip in self.bgp_agent_api.host_ips:
             if host_ip.version == 4:
-                flows.append(f"priority=100,ip,in_port={nic_ofport},"
+                flows.append(f"priority=100,ip,in_port={self.nic_ofport},"
                              f"nw_dst={host_ip.ip} actions=NORMAL")
             elif host_ip.version == 6:
-                flows.append(f"priority=100,ipv6,in_port={nic_ofport},"
+                flows.append(f"priority=100,ipv6,in_port={self.nic_ofport},"
                              f"ipv6_dst={host_ip.ip} actions=NORMAL")
 
         return flows
 
     @utils.throttler()
     def configure_flows(self):
-        """Add BGP-specific OpenFlow rules using bundle from temporary file"""
+        LOG.debug("XXX configuring BGP bridge flows for %s", self.name)
         # The resulting openflows rules that will be written to a temporary
         # file and applied to the bridge.
         if not self.exists:
@@ -208,50 +306,16 @@ class BGPChassisBridge(Bridge):
             "priority=0, actions=normal",
         ]
 
-        try:
-            nic_ofport = self.get_bridge_nic_ofport()
-        except exc.BridgeNicException:
-            LOG.info("No NIC found for %s, skipping flows", self.name)
-            nic_ofport = None
-        else:
-            flows.extend(self._get_flows_for_nic_port(nic_ofport))
 
-        try:
-            patch_port_ofport = self.get_bridge_patch_port_ofport()
-        except exc.BridgePatchPortException:
-            LOG.info(
-                "No patch port found for %s, skipping patch_port and "
-                "LRP MAC map flows", self.name)
-        else:
-            flows.extend(self._get_flows_for_patch_port(patch_port_ofport))
-            if nic_ofport:
-                flows.extend(self._get_lrp_flow(nic_ofport, patch_port_ofport))
+        flows.extend(self._get_flows_for_nic_port())
+        flows.extend(self._get_flows_for_patch_port())
+        flows.extend(self._get_lrp_flow())
 
         try:
             self._apply_flows_as_bundle(flows)
         except Exception as e:
-            LOG.error("Failed to configure BGP flows on bridge %s: %s",
-                      self.name, e)
-
-    @utils.throttler()
-    def configure_flows_for_patch_port(self, patch_port_ofport):
-        LOG.debug("XXX configuring BGP flows for patch port %s", patch_port_ofport)
-        flows = self._get_flows_for_patch_port(patch_port_ofport)
-        try:
-            self._apply_flows_as_bundle(flows)
-        except Exception as e:
-            LOG.error("Failed to configure BGP flows on bridge %s: %s",
-                      self.name, e)
-
-    @utils.throttler()
-    def configure_flows_for_nic_port(self, nic_ofport):
-        LOG.debug("XXX configuring BGP flows for NIC port %s", nic_ofport)
-        flows = self._get_flows_for_nic_port(nic_ofport)
-        try:
-            self._apply_flows_as_bundle(flows)
-        except Exception as e:
-            LOG.error("Failed to configure BGP flows on bridge %s: %s",
-                      self.name, e)
+            LOG.error("Failed to configure BGP flows on bridge %s: %s: %s",
+                      self.name, e, flows)
 
     def get_bgp_connection_tuple(self):
         """Get the peer IPs of the chassis in the SB table"""

@@ -97,7 +97,6 @@ class LocalOVSEvent(BGPAgentEvent):
 
     def run(self, event, row, old):
         desired_mappings = self._get_desired_mappings(row, old)
-        self.bgp_agent.load_bgp_bridges()
         self.bgp_agent.configure_bgp_bridge_mappings(desired_mappings)
 
 
@@ -122,14 +121,8 @@ class UpdateLocalOVSEvent(LocalOVSEvent):
 
 
 class NewBgpBridgeEvent(BGPAgentEvent):
-    EVENTS = (BGPAgentEvent.ROW_CREATE,)
+    EVENTS = (BGPAgentEvent.ROW_CREATE, BGPAgentEvent.ROW_UPDATE,)
     TABLE = 'Bridge'
-
-    def match_fn(self, event, row, old):
-        if not super().match_fn(event, row, old):
-            return False
-        bgp_bridges = self._get_bgp_bridges(row._idl)
-        return row.name in self.bgp_agent.bgp_bridges
 
     @staticmethod
     def _get_bgp_bridges(idl):
@@ -139,84 +132,93 @@ class NewBgpBridgeEvent(BGPAgentEvent):
                 "Expected 1 Open_vSwitch entry, got %s", len(ovs_entries))
             return []
         bgp_bridges_text = ovs_entries[0].external_ids.get(
-            'bgp-peer-bridges', '')
+            constants.AGENT_BGP_PEER_BRIDGES, '')
         if bgp_bridges_text:
             return bgp_bridges_text.split(',')
         return []
 
-    def run(self, event, row, old):
-        bgp_bridge = self.bgp_agent.bgp_bridges[row.name]
-        bgp_bridge.configure_flows()
-        self.bgp_agent.update_chassis_peer_connections()
+    def _is_bgp_bridge(self, row):
+        bgp_bridges = self._get_bgp_bridges(row._idl)
+        return row.name in bgp_bridges
 
+    def _has_nic_iface(self, row):
+        for port in row.ports:
+            iface = port.interfaces[0]
+            if iface.type == '':
+                LOG.debug("XXX found iface: %s - %s", row.name, iface.name)
+                return True
+        return False
 
-class BgpBridgePortEvent(BGPAgentEvent):
-    EVENTS = (BGPAgentEvent.ROW_CREATE,)
-    TABLE = 'Interface'
-    TYPES = ('', 'patch')
-
-    def get_bgp_bridge(self, port_name):
-        # We just need access to BaseOVS
-        some_bridge = next(iter(self.bgp_agent.bgp_bridges.values()))
-        port_bridge = some_bridge.ovs_bridge.get_bridge_for_iface(port_name)
-        return port_bridge
+    def _nic_iface_added(self, row, old):
+        added_ports = set(row.ports) - set(old.ports)
+        return any(port.interfaces[0].type == '' for port in added_ports)
 
     def match_fn(self, event, row, old):
         if not super().match_fn(event, row, old):
+            return False
+
+        if not self._is_bgp_bridge(row):
+            return False
+
+        if event == BGPAgentEvent.ROW_UPDATE:
+            if (not hasattr(old, 'ports') or
+                    not self._nic_iface_added(row, old)):
+                return False
+
+        return self._has_nic_iface(row)
+
+    def run(self, event, row, old):
+        LOG.debug("XXX NewBgpBridgeEvent: %s", row.name)
+        bgp_bridge = self.bgp_agent.create_bgp_bridge(row.name)
+        self.bgp_agent.watch_patch_port_created_event(bgp_bridge)
+        bgp_bridge.discover_bgp_peer_in_thread()
+
+
+class BGPBridgePatchPortCreatedEvent(BGPAgentEvent):
+    EVENTS = (BGPAgentEvent.ROW_CREATE,)
+    TABLE = 'Interface'
+    ONETIME = True
+
+    def __init__(self, agent_api, bgp_bridge_name):
+        super().__init__(agent_api)
+        self.bgp_bridge_name = bgp_bridge_name
+        LOG.debug("XXX BGPBridgePatchPortCreatedEvent: %s", self.bgp_bridge_name)
+
+    def _get_port_bridge(self, port_name):
+        # We just need access to BaseOVS
+        some_bridge = next(iter(self.bgp_agent.bgp_bridges.values()))
+        return some_bridge.ovs_bridge.get_bridge_for_iface(port_name)
+
+    def match_fn(self, event, row, old):
+        LOG.debug("XXX type BGPBridgePatchPortCreatedEvent: %s - %s", row.name, row.type)
+        if not super().match_fn(event, row, old):
+            return False
+
+        if row.type != 'patch':
             return False
 
         try:
-            port_bridge = self.get_bgp_bridge(row.name)
-            LOG.debug("XXX matching BgpBridgePortEvent: %s", port_bridge)
+            port_bridge_name = self._get_port_bridge(row.name)
         except StopIteration:
-            # No BGP bridges configured
+            LOG.warning("No BGP bridge found in agent.")
             return False
+        LOG.debug("XXX bridge BGPBridgePatchPortCreatedEvent: %s - %s", port_bridge_name, self.bgp_bridge_name)
 
-        # The port is not on a BGP bridge
-        if port_bridge not in self.bgp_agent.bgp_bridges:
-            return False
-
-        # We are interested in the NIC or patch port to the integration bridge
-        if row.type not in self.TYPES:
-            return False
-
-        return True
+        return port_bridge_name == self.bgp_bridge_name
 
     def run(self, event, row, old):
-        LOG.debug("XXX BgpBridgePortEvent: %s", row.name)
-        bgp_bridge = self.bgp_agent.bgp_bridges[self.get_bgp_bridge(row.name)]
-        ofport = row.ofport[0]
-        if row.type == 'patch':
-            bgp_bridge.configure_flows_for_patch_port(ofport)
-        else:
-            bgp_bridge.configure_flows_for_nic_port(ofport)
-
-        self.bgp_agent.update_chassis_peer_connections()
-
-
-class BGPChassisEvent(BGPAgentEvent):
-    """Base class for BGP chassis events."""
-    TABLE = 'Chassis'
-
-    def match_fn(self, event, row, old):
-        if not super().match_fn(event, row, old):
-            return False
-        return row.name == self.agent_api.chassis
-
-    def run(self, event, row, old):
-        self.bgp_agent.configure_all_chassis_bgp_bridges()
-        self.bgp_agent.update_chassis_peer_connections()
-
-
-class CreateChassisEvent(BGPChassisEvent):
-    """New chassis that already has LRP MAC map configured."""
-    EVENTS = (BGPChassisEvent.ROW_CREATE,)
+        LOG.debug("XXX BGPBridgePatchPortCreatedEvent: %s", row.name)
+        port_bridge_name = self._get_port_bridge(row.name)
+        bgp_bridge = self.bgp_agent.bgp_bridges[port_bridge_name]
+        bgp_bridge.patch_port_ofport = row.ofport[0]
+        if bgp_bridge.lrp_mac:
+            bgp_bridge.configure_flows()
 
 
 class PortBindingLrpMacEvent(BGPAgentEvent):
     """Port_Binding update event - set LRP MAC."""
     TABLE = 'Port_Binding'
-    EVENTS = (BGPChassisEvent.ROW_CREATE, BGPChassisEvent.ROW_UPDATE)
+    EVENTS = (BGPAgentEvent.ROW_CREATE, BGPAgentEvent.ROW_UPDATE,)
 
     def __init__(self, agent_api):
         super().__init__(agent_api)
@@ -234,7 +236,14 @@ class PortBindingLrpMacEvent(BGPAgentEvent):
         return True
 
     def run(self, event, row, old):
+        LOG.debug("XXX PortBindingLrpMacEvent: %s", row.logical_port)
         lrp_mac = row.mac[0].split(' ', 1)[0]
-        self.bgp_agent.configure_chassis_bgp_bridge(
-            row.external_ids[constants.BGP_CHASSIS_NETWORK_NAME],
-            lrp_mac)
+        network_name = row.external_ids[constants.BGP_CHASSIS_NETWORK_NAME]
+        try:
+            bridge = self.bgp_agent.bgp_bridges[network_name]
+        except KeyError:
+            LOG.warning("No BGP bridge found for network %s", network_name)
+            return
+        bridge.lrp_mac = lrp_mac
+        if bridge.patch_port_ofport:
+            bridge.configure_flows()
