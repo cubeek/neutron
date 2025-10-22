@@ -57,6 +57,11 @@ def requires_ovn_version_with_bgp():
     return outer
 
 
+def is_policy_output_port_column_supported(idl):
+    return idlutils.table_has_column(
+        idl, 'Logical_Router_Policy', 'output_port')
+
+
 class BaseBgpIDLTestCase(n_base.BaseLoggingTestCase):
     schemas = []
     idl_schema_map = {
