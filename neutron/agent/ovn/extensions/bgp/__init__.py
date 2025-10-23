@@ -67,3 +67,33 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
         bgp_bridge = bridge.BGPChassisBridge(self, bridge_name)
         self.bgp_bridges[bridge_name] = bgp_bridge
         return bgp_bridge
+
+    def watch_patch_port_created_event(self, bgp_bridge):
+        # Check the patch port doesn't exist on the bridge
+        patch_ports_ofports = (
+            bgp_bridge.ovs_bridge.get_bridge_patch_ports_ofports())
+
+        if not patch_ports_ofports:
+            LOG.debug("Waiting for a patch port creation on bridge %s",
+                      bgp_bridge.name)
+            event_handler = self.agent_api.ovs_idl.idl.notify_handler
+            event = events.BGPBridgePatchPortCreatedEvent(
+                self.agent_api, bgp_bridge.name)
+            event_handler.watch_event(event)
+
+            # Check the patch port again in case it was created in the meantime
+            patch_ports_ofports = (
+                bgp_bridge.ovs_bridge.get_bridge_patch_ports_ofports())
+            if patch_ports_ofports:
+                LOG.debug(
+                    "The patch port was created in the meantime on bridge %s "
+                    "with ofport %d, removing the onetime event from the "
+                    "queue.", bgp_bridge.name, patch_ports_ofports[0])
+                event_handler.unwatch_event(event)
+                bgp_bridge.patch_port_ofport = patch_ports_ofports[0]
+                bgp_bridge.configure_flows()
+        else:
+            LOG.debug("The BGP bridge %s already has a patch port with ofport"
+                      " %d", bgp_bridge.name, patch_ports_ofports[0])
+            bgp_bridge.patch_port_ofport = patch_ports_ofports[0]
+            bgp_bridge.configure_flows()

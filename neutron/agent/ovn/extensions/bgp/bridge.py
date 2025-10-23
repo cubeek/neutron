@@ -47,11 +47,19 @@ class BGPChassisBridge(Bridge):
     def __init__(self, bgp_agent_api, name):
         super().__init__(bgp_agent_api, name)
         self.lrp_mac = self._get_lrp_mac()
+        self.patch_port_ofport = self._get_bridge_patch_port_ofport()
 
     def __str__(self):
         return f"BGPChassisBridge(name={self.name})"
 
     __repr__ = __str__
+
+    def bridge_ifaces(self):
+        ifaces = self.ovs_bridge.get_iface_name_list()
+        if not ifaces:
+            return []
+        return self.ovs_idl.db_list(
+            'Interface', ifaces, if_exists=True).execute(check_error=True)
 
     def _get_lrp_mac(self):
         ext_ids = {constants.LRP_NETWORK_NAME_EXT_ID_KEY: self.name}
@@ -67,3 +75,20 @@ class BGPChassisBridge(Bridge):
 
         LOG.debug("LRP MAC does not exist yet for %s", self.name)
         return None
+
+    def _get_bridge_ofports_per_type(self, type):
+        return [
+            iface['ofport'] for iface in self.bridge_ifaces()
+            if iface['type'] == type]
+
+    def _get_bridge_patch_port_ofport(self):
+        patch_ports_ofports = self._get_bridge_ofports_per_type('patch')
+        if len(patch_ports_ofports) != 1:
+            LOG.debug("The patch port for bridge %s does not exist yet",
+                      self.name)
+            return None
+        return patch_ports_ofports[0]
+
+    def configure_flows(self):
+        # TODO(jlibosva) Implement flows configuration
+        pass

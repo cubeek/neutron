@@ -167,7 +167,8 @@ class NewBgpBridgeEvent(BGPAgentEvent):
         return self._has_nic_iface(row)
 
     def run(self, event, row, old):
-        self.bgp_agent.create_bgp_bridge(row.name)
+        bgp_bridge = self.bgp_agent.create_bgp_bridge(row.name)
+        self.bgp_agent.watch_patch_port_created_event(bgp_bridge)
 
 
 class PortBindingLrpMacEvent(BGPAgentEvent):
@@ -199,3 +200,47 @@ class PortBindingLrpMacEvent(BGPAgentEvent):
             LOG.warning("No BGP bridge found for network %s", network_name)
             return
         bridge.lrp_mac = lrp_mac
+        if bridge.patch_port_ofport:
+            bridge.configure_flows()
+
+
+class BGPBridgePatchPortCreatedEvent(BGPAgentEvent):
+    EVENTS = (BGPAgentEvent.ROW_CREATE,)
+    TABLE = 'Interface'
+    ONETIME = True
+
+    def __init__(self, agent_api, bgp_bridge_name):
+        super().__init__(agent_api)
+        self.bgp_bridge_name = bgp_bridge_name
+
+    @property
+    def key(self):
+        return (self.__class__, self.table,
+                tuple(self.events), self.bgp_bridge_name)
+
+    def _get_port_bridge(self, port_name):
+        # We just need access to BaseOVS
+        some_bridge = next(iter(self.bgp_agent.bgp_bridges.values()))
+        return some_bridge.ovs_bridge.get_bridge_for_iface(port_name)
+
+    def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+
+        if row.type != 'patch':
+            return False
+
+        try:
+            port_bridge_name = self._get_port_bridge(row.name)
+        except StopIteration:
+            LOG.warning("No BGP bridge found in agent.")
+            return False
+
+        return port_bridge_name == self.bgp_bridge_name
+
+    def run(self, event, row, old):
+        port_bridge_name = self._get_port_bridge(row.name)
+        bgp_bridge = self.bgp_agent.bgp_bridges[port_bridge_name]
+        bgp_bridge.patch_port_ofport = row.ofport[0]
+        if bgp_bridge.lrp_mac:
+            bgp_bridge.configure_flows()
