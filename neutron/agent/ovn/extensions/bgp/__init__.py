@@ -13,13 +13,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import netaddr
 from oslo_log import log
 
+from neutron.agent.linux import ip_lib
 from neutron.agent.ovn.extensions.bgp import bridge
 from neutron.agent.ovn.extensions.bgp import events
 from neutron.agent.ovn.extensions import extension_manager as ovn_ext_mgr
 
 LOG = log.getLogger(__name__)
+
+LOCALHOST_ADDRESSES = ['127.0.0.1', '::1']
 
 
 class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
@@ -62,6 +66,21 @@ class BGPAgentExtension(ovn_ext_mgr.OVNAgentExtension):
         return [
             events.PortBindingLrpMacEvent,
         ]
+
+    @property
+    def host_ips(self):
+        host_ips = self.loopback_ips
+        for bgp_bridge in self.bgp_bridges.values():
+            host_ips.extend(bgp_bridge.ips)
+        return host_ips
+
+    @property
+    def loopback_ips(self):
+        cidrs = [netaddr.IPNetwork(dev['cidr'])
+                 for dev in ip_lib.get_devices_with_ip(
+                 namespace=None, name=ip_lib.LOOPBACK_DEVNAME)]
+        return [cidr for cidr in cidrs
+                if str(cidr.ip) not in LOCALHOST_ADDRESSES]
 
     def create_bgp_bridge(self, bridge_name):
         bgp_bridge = bridge.BGPChassisBridge(self, bridge_name)
