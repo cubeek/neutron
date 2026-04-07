@@ -501,8 +501,10 @@ class PortBindingChassisEvent(row_event.RowEvent):
         router = host = None
         chassis = getattr(row, 'chassis', None)
         if chassis:
-            router = row.datapath.external_ids.get('name', '').replace(
-                'neutron-', '')
+            datapath_ext_ids = row.datapath.external_ids
+            if ovn_const.OVN_ROUTER_NAME_EXT_ID_KEY not in datapath_ext_ids:
+                return
+            router = datapath_ext_ids.get('name', '').replace('neutron-', '')
             host = chassis[0].hostname
             LOG.info("Router %(router)s is bound to host %(host)s",
                      {'router': router, 'host': host})
@@ -510,7 +512,12 @@ class PortBindingChassisEvent(row_event.RowEvent):
             router, host)
 
 
-class LogicalSwitchPortCreateEvent(row_event.RowEvent):
+class LogicalSwitchPortEvent(row_event.RowEvent):
+    def match_fn(self, event, row, old=None):
+        return ovn_const.OVN_PORT_NAME_EXT_ID_KEY in row.external_ids
+
+
+class LogicalSwitchPortCreateEvent(LogicalSwitchPortEvent):
     """Row create event - Checks Logical_Switch_Port is UP and enabled.
 
     On connection, we get a dump of all ports, so if there is a neutron
@@ -531,7 +538,7 @@ class LogicalSwitchPortCreateEvent(row_event.RowEvent):
             self.driver.set_port_status_down(row.name)
 
 
-class LogicalSwitchPortUpdateUpEvent(row_event.RowEvent):
+class LogicalSwitchPortUpdateUpEvent(LogicalSwitchPortEvent):
     """Row update event - Logical_Switch_Port UP or enabled going True
 
     This happens when the VM goes up.
@@ -546,6 +553,9 @@ class LogicalSwitchPortUpdateUpEvent(row_event.RowEvent):
         self.event_name = 'LogicalSwitchPortUpdateUpEvent'
 
     def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+
         if not (utils.is_lsp_up(row) and utils.is_lsp_enabled(row)):
             return False
 
@@ -562,7 +572,7 @@ class LogicalSwitchPortUpdateUpEvent(row_event.RowEvent):
         self.driver.set_port_status_up(row.name)
 
 
-class LogicalSwitchPortUpdateDownEvent(row_event.RowEvent):
+class LogicalSwitchPortUpdateDownEvent(LogicalSwitchPortEvent):
     """Row update event - Logical_Switch_Port UP or enabled going to False
 
     This happens when the VM goes down or the port is disabled.
@@ -577,6 +587,9 @@ class LogicalSwitchPortUpdateDownEvent(row_event.RowEvent):
         self.event_name = 'LogicalSwitchPortUpdateDownEvent'
 
     def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+
         if (hasattr(old, 'up') and
                 utils.is_lsp_up(old) and
                 not utils.is_lsp_up(row)):
@@ -594,7 +607,7 @@ class LogicalSwitchPortUpdateDownEvent(row_event.RowEvent):
         self.driver.set_port_status_down(row.name)
 
 
-class LogicalSwitchPortUpdateLogicalRouterPortEvent(row_event.RowEvent):
+class LogicalSwitchPortUpdateLogicalRouterPortEvent(LogicalSwitchPortEvent):
     """Row update event - Logical_Switch_Port, that updates the sibling LRP"""
 
     def __init__(self, driver):
@@ -607,6 +620,9 @@ class LogicalSwitchPortUpdateLogicalRouterPortEvent(row_event.RowEvent):
         self.admin_context = neutron_context.get_admin_context()
 
     def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+
         device_id = row.external_ids.get(ovn_const.OVN_DEVID_EXT_ID_KEY)
         device_owner = row.external_ids.get(
             ovn_const.OVN_DEVICE_OWNER_EXT_ID_KEY)
@@ -652,7 +668,7 @@ class LogicalSwitchPortUpdateLogicalRouterPortEvent(row_event.RowEvent):
                        'event_name': self.event_name})
 
 
-class PortBindingUpdateVirtualPortsEvent(row_event.RowEvent):
+class PortBindingUpdateVirtualPortsEvent(LogicalSwitchPortEvent):
     """Row update event - Port_Binding for virtual ports
 
     The goal of this event is to catch the events of the virtual ports and
@@ -667,6 +683,9 @@ class PortBindingUpdateVirtualPortsEvent(row_event.RowEvent):
         self.event_name = 'PortBindingUpdateVirtualPortsEvent'
 
     def match_fn(self, event, row, old):
+        if not super().match_fn(event, row, old):
+            return False
+
         # This event should catch the events related to virtual parents (that
         # are associated to virtual ports).
         if event == self.ROW_DELETE:
@@ -725,6 +744,9 @@ class FIPAddDeleteEvent(row_event.RowEvent):
         super().__init__(
             events, table, (('type', '=', 'dnat_and_snat'),))
         self.event_name = 'FIPAddDeleteEvent'
+
+    def match_fn(self, event, row, old=None):
+        return bool(row.external_ids.get(ovn_const.OVN_FIP_EXT_ID_KEY))
 
     def run(self, event, row, old):
         # When a FIP is added or deleted, we will delete all entries in the
