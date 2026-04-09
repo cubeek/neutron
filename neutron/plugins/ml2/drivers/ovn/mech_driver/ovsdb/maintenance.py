@@ -636,6 +636,51 @@ class DBInconsistenciesPeriodics(SchemaAwarePeriodicsBase):
         periodic_run_limit=ovn_const.MAINTENANCE_TASK_RETRY_LIMIT,
         spacing=ovn_const.MAINTENANCE_ONE_RUN_TASK_SPACING,
         run_immediately=True)
+    def add_provnet_ext_id_to_localnet_ports(self):
+        """Backfill OVN_PROVNET_EXT_ID_KEY on existing localnet ports.
+
+        Newly created localnet ports will have the ``neutron:provnet-network``
+        external_id set to the physical network name. This one-time task
+        backfills the key on any existing ports that were created before this
+        change.
+        """
+        context = n_context.get_admin_context()
+        segments = network_obj.NetworkSegment.get_objects(context)
+        neutron_port_to_physnet = {
+            utils.ovn_provnet_port_name(seg.id): seg.physical_network
+            for seg in segments
+            if seg.physical_network
+        }
+
+        ports = self._nb_idl.db_find_rows(
+            'Logical_Switch_Port', ('type', '=', ovn_const.LSP_TYPE_LOCALNET)
+        ).execute(check_error=True)
+
+        cmds = []
+        for port in ports:
+            physnet = neutron_port_to_physnet.get(port.name)
+            if not physnet:
+                continue
+            if ovn_const.OVN_PROVNET_EXT_ID_KEY in port.external_ids:
+                continue
+            cmds.append(self._nb_idl.db_set(
+                'Logical_Switch_Port', port.name,
+                ('external_ids',
+                 {ovn_const.OVN_PROVNET_EXT_ID_KEY: physnet})))
+
+        if cmds:
+            with self._nb_idl.transaction(check_error=True) as txn:
+                for cmd in cmds:
+                    txn.add(cmd)
+
+        raise periodics.NeverAgain()
+
+    # A static spacing value is used here, but this method will only run
+    # once per lock due to the use of periodics.NeverAgain().
+    @has_lock_periodic(
+        periodic_run_limit=ovn_const.MAINTENANCE_TASK_RETRY_LIMIT,
+        spacing=ovn_const.MAINTENANCE_ONE_RUN_TASK_SPACING,
+        run_immediately=True)
     def check_redirect_type_router_gateway_ports(self):
         """Check OVN router gateway ports
         Check for the option "redirect-type=bridged" value for
